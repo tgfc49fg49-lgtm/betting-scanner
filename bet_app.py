@@ -23,51 +23,196 @@ SPORTS = {
 
 BOOKS_TO_IGNORE = ["Bovada", "BetOnline.ag", "LowVig.ag"]
 
-st.set_page_config(page_title="CD Betting", layout="wide")
+st.set_page_config(
+    page_title="CD Betting",
+    page_icon="🏆",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
 st.markdown("""
 <style>
-.stApp { background:#090909; color:#e8e8e8; }
-[data-testid="stSidebar"] { display:none; }
-[data-testid="collapsedControl"] { display:none; }
-.block-container { max-width:1250px; padding-top:1.2rem; }
-.cd-header {
-    background:linear-gradient(135deg,#111,#1b1b1b);
-    border:1px solid #444;
-    border-radius:18px;
-    padding:24px;
-    margin-bottom:16px;
+[data-testid="stSidebar"] {display:none;}
+[data-testid="collapsedControl"] {display:none;}
+.block-container {max-width: 1180px; padding-top: 1rem; padding-bottom: 4rem;}
+
+.stApp {
+    background: linear-gradient(180deg, #edf3fb 0%, #f7f9fc 100%);
+    color: #111827;
 }
-.cd-logo { color:#ff1f2d; font-size:46px; font-weight:900; }
-.cd-subtitle { color:#c0c0c0; font-size:15px; }
-.nav-bar {
-    display:flex; gap:10px; flex-wrap:wrap;
-    background:#111; border:1px solid #333;
-    padding:12px; border-radius:16px; margin-bottom:20px;
+
+.hero {
+    background: linear-gradient(135deg, #143d73 0%, #0d2446 70%);
+    color: white;
+    border-radius: 28px;
+    padding: 28px;
+    box-shadow: 0 20px 40px rgba(13,36,70,.22);
+    margin-bottom: 18px;
 }
-.metric-card, .bet-card {
-    background:#121212; border:1px solid #333;
-    border-radius:16px; padding:16px; margin-bottom:14px;
+
+.logo {
+    font-size: 42px;
+    font-weight: 950;
+    letter-spacing: -1px;
 }
-.bet-card { border-left:6px solid #c1121f; }
-.metric-label { color:#c0c0c0; font-size:12px; text-transform:uppercase; }
-.metric-value { font-size:30px; font-weight:900; color:white; }
-.tag-red {
-    background:#c1121f; color:white; padding:4px 10px;
-    border-radius:999px; font-weight:800; font-size:12px;
+
+.subtitle {
+    color: #dce8f7;
+    font-size: 15px;
+    margin-top: 4px;
 }
-.tag-silver {
-    background:#c0c0c0; color:#080808; padding:4px 10px;
-    border-radius:999px; font-weight:800; font-size:12px;
+
+.nav-wrap {
+    background: white;
+    border-radius: 22px;
+    padding: 10px;
+    box-shadow: 0 10px 30px rgba(20,61,115,.12);
+    margin-bottom: 18px;
 }
+
+div[role="radiogroup"] {
+    gap: 8px;
+}
+
+.metric {
+    background: white;
+    border-radius: 22px;
+    padding: 18px;
+    box-shadow: 0 10px 30px rgba(20,61,115,.10);
+    border: 1px solid #e7edf5;
+}
+
+.metric-label {
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.metric-value {
+    color: #143d73;
+    font-size: 30px;
+    font-weight: 950;
+}
+
+.pick-card {
+    background: white;
+    border-radius: 26px;
+    padding: 18px;
+    margin-bottom: 16px;
+    border: 1px solid #e7edf5;
+    box-shadow: 0 12px 32px rgba(20,61,115,.12);
+}
+
+.pick-card-red {
+    border-left: 7px solid #e11d48;
+}
+
+.pick-card-blue {
+    border-left: 7px solid #2563eb;
+}
+
+.pick-card-gray {
+    border-left: 7px solid #94a3b8;
+}
+
+.badge-red {
+    background: #e11d48;
+    color: white;
+    padding: 5px 11px;
+    border-radius: 999px;
+    font-weight: 900;
+    font-size: 12px;
+}
+
+.badge-blue {
+    background: #143d73;
+    color: white;
+    padding: 5px 11px;
+    border-radius: 999px;
+    font-weight: 900;
+    font-size: 12px;
+}
+
+.badge-gray {
+    background: #e5e7eb;
+    color: #111827;
+    padding: 5px 11px;
+    border-radius: 999px;
+    font-weight: 900;
+    font-size: 12px;
+}
+
+.card-title {
+    font-size: 22px;
+    font-weight: 950;
+    color: #111827;
+    margin-top: 10px;
+}
+
+.card-sub {
+    color: #475569;
+    font-size: 14px;
+    margin-top: 4px;
+}
+
+.stat-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.stat-pill {
+    background: #f1f5f9;
+    color: #0f172a;
+    padding: 8px 11px;
+    border-radius: 14px;
+    font-weight: 800;
+    font-size: 13px;
+}
+
+.link-row a {
+    display: inline-block;
+    margin-right: 8px;
+    margin-top: 12px;
+    background: #143d73;
+    color: white !important;
+    text-decoration: none;
+    padding: 8px 12px;
+    border-radius: 14px;
+    font-weight: 900;
+    font-size: 13px;
+}
+
+.link-row a:nth-child(2) {background:#e11d48;}
+.link-row a:nth-child(3) {background:#334155;}
+
 div.stButton > button {
-    background:#c1121f; color:white; border-radius:12px;
-    border:1px solid #c1121f; font-weight:800;
+    background: #e11d48;
+    color: white;
+    border-radius: 16px;
+    border: 0;
+    font-weight: 950;
+    padding: .6rem 1rem;
 }
+
 div.stButton > button:hover {
-    background:#8f0d17; color:white; border:1px solid #c0c0c0;
+    background: #be123c;
+    color: white;
 }
-a { color:#ff4b5c !important; }
+
+[data-testid="stDataFrame"] {
+    border-radius: 22px;
+    overflow: hidden;
+    box-shadow: 0 10px 30px rgba(20,61,115,.10);
+}
+
+@media (max-width: 700px) {
+    .logo {font-size: 34px;}
+    .hero {padding: 22px;}
+    .card-title {font-size: 19px;}
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,7 +230,7 @@ def decimal_to_american(decimal_odds):
 
 def format_time(commence_time):
     utc_time = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
-    return utc_time.astimezone(ZoneInfo("America/Chicago")).strftime("%B %d, %Y • %I:%M %p CT")
+    return utc_time.astimezone(ZoneInfo("America/Chicago")).strftime("%b %d • %I:%M %p CT")
 
 def rating_from_edge(edge):
     if edge >= 5:
@@ -108,12 +253,10 @@ def suggested_units(edge):
 def make_links(matchup):
     q = quote_plus(matchup)
     return {
-        "Google News": f"https://www.google.com/search?q={q}+local+team+news&tbm=nws",
-        "Local News": f"https://www.google.com/search?q={q}+local+sports+news",
-        "Injuries": f"https://www.google.com/search?q={q}+injury+report+lineups",
+        "News": f"https://www.google.com/search?q={q}+local+team+news&tbm=nws",
+        "Local": f"https://www.google.com/search?q={q}+local+sports+news",
         "Preview": f"https://www.google.com/search?q={q}+betting+preview+prediction",
-        "ESPN": f"https://www.google.com/search?q=ESPN+{q}",
-        "CBS": f"https://www.google.com/search?q=CBS+Sports+{q}",
+        "Injuries": f"https://www.google.com/search?q={q}+injury+report+lineups",
     }
 
 def fetch_odds(sport_key, markets):
@@ -129,6 +272,7 @@ def fetch_odds(sport_key, markets):
 def get_scores(sport_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores"
     params = {"apiKey": API_KEY, "daysFrom": 1}
+
     try:
         r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
@@ -140,29 +284,13 @@ def get_scores(sport_key):
     scores = {}
     for game in games:
         matchup = f'{game.get("away_team")} @ {game.get("home_team")}'
-        score_text = "Scheduled / no score yet"
+        score_text = "Scheduled"
         if game.get("scores"):
             parts = [f'{s["name"]}: {s["score"]}' for s in game["scores"]]
             score_text = " | ".join(parts)
-            score_text += " | Final" if game.get("completed") else " | Live / recent"
+            score_text += " | Final" if game.get("completed") else " | Live"
         scores[matchup] = score_text
     return scores
-
-def scan_sport(sport_name, sport_key, markets):
-    response = fetch_odds(sport_key, markets)
-
-    if response.status_code != 200:
-        results = []
-        for market in markets:
-            r = fetch_odds(sport_key, [market])
-            if r.status_code == 200:
-                parsed, _ = parse_games(sport_name, sport_key, r.json())
-                results.extend(parsed)
-        if results:
-            return results, None
-        return [], response.text
-
-    return parse_games(sport_name, sport_key, response.json())
 
 def parse_games(sport_name, sport_key, games):
     scores = get_scores(sport_key)
@@ -171,7 +299,7 @@ def parse_games(sport_name, sport_key, games):
     for game in games:
         matchup = f'{game["away_team"]} @ {game["home_team"]}'
         game_time = format_time(game["commence_time"])
-        live_score = scores.get(matchup, "Not live / no score available")
+        live_score = scores.get(matchup, "No live score")
         links = make_links(matchup)
 
         prices = {}
@@ -197,12 +325,12 @@ def parse_games(sport_name, sport_key, games):
 
                     if pick_key not in prices:
                         prices[pick_key] = {
-                            "sport": sport_name,
-                            "game_time": game_time,
-                            "matchup": matchup,
-                            "live_score": live_score,
-                            "market": market_key,
-                            "pick": pick_label,
+                            "Sport": sport_name,
+                            "Game Time": game_time,
+                            "Matchup": matchup,
+                            "Live Score": live_score,
+                            "Market": market_key,
+                            "Pick": pick_label,
                             "links": links,
                             "lines": [],
                         }
@@ -226,12 +354,12 @@ def parse_games(sport_name, sport_key, games):
                 continue
 
             results.append({
-                "Sport": data["sport"],
-                "Game Time": data["game_time"],
-                "Matchup": data["matchup"],
-                "Live Score": data["live_score"],
-                "Market": data["market"],
-                "Pick": data["pick"],
+                "Sport": data["Sport"],
+                "Game Time": data["Game Time"],
+                "Matchup": data["Matchup"],
+                "Live Score": data["Live Score"],
+                "Market": data["Market"],
+                "Pick": data["Pick"],
                 "Best Odds": best_line["odds"],
                 "Best Book": best_line["book"],
                 "Book Implied %": round(best_line["prob"] * 100, 2),
@@ -239,25 +367,43 @@ def parse_games(sport_name, sport_key, games):
                 "Edge %": edge,
                 "Rating": rating_from_edge(edge),
                 "Suggested Units": suggested_units(edge),
-                "Google News": data["links"]["Google News"],
-                "Local News": data["links"]["Local News"],
-                "Injuries": data["links"]["Injuries"],
+                "News": data["links"]["News"],
+                "Local": data["links"]["Local"],
                 "Preview": data["links"]["Preview"],
-                "ESPN": data["links"]["ESPN"],
-                "CBS": data["links"]["CBS"],
+                "Injuries": data["links"]["Injuries"],
             })
 
     return results, None
 
+def scan_sport(sport_name, sport_key, markets):
+    response = fetch_odds(sport_key, markets)
+
+    if response.status_code != 200:
+        results = []
+        for market in markets:
+            r = fetch_odds(sport_key, [market])
+            if r.status_code == 200:
+                parsed, _ = parse_games(sport_name, sport_key, r.json())
+                results.extend(parsed)
+
+        if results:
+            return results, None
+
+        return [], response.text
+
+    return parse_games(sport_name, sport_key, response.json())
+
 def scan_all_sports():
     all_results = []
     errors = []
+
     for sport_name, info in SPORTS.items():
         results, error = scan_sport(sport_name, info["key"], info["markets"])
         if error:
             errors.append(f"{sport_name}: {error}")
         else:
             all_results.extend(results)
+
     return all_results, errors
 
 def find_arbitrage_for_sport(sport_name, sport_key, markets):
@@ -330,7 +476,7 @@ def find_arbitrage_for_sport(sport_name, sport_key, markets):
                     "Leg 2 Book": best_outcomes[1]["book"],
                     "Total Implied %": round(total_prob * 100, 2),
                     "Arb Profit %": arb_profit,
-                    "News": links["Google News"],
+                    "News": links["News"],
                     "Preview": links["Preview"],
                 })
 
@@ -348,17 +494,14 @@ def find_all_arbitrage():
     return sorted(all_arbs, key=lambda x: x["Arb Profit %"], reverse=True), errors
 
 def build_parlays(df, legs=3, max_results=10):
-    candidates = df[
-        (df["Rating"] != "PASS") &
-        (df["Book Implied %"] >= 45)
-    ].copy()
+    candidates = df[(df["Rating"] != "PASS") & (df["Book Implied %"] >= 45)].copy()
 
     if candidates.empty:
         candidates = df[df["Book Implied %"] >= 50].copy()
 
     candidates = candidates.sort_values(["Edge %", "Book Implied %"], ascending=False).head(30)
-
     parlays = []
+
     for combo in itertools.combinations(candidates.to_dict("records"), legs):
         matchups = [x["Matchup"] for x in combo]
         if len(set(matchups)) < len(matchups):
@@ -373,78 +516,82 @@ def build_parlays(df, legs=3, max_results=10):
             probability_total *= leg["Book Implied %"] / 100
             edge_total += leg["Edge %"]
 
-        parlays.append({
+        parlay = {
             "Legs": legs,
             "Combined Odds": decimal_to_american(decimal_total),
             "Estimated Hit %": round(probability_total * 100, 2),
             "Total Edge": round(edge_total, 2),
-            "Leg 1": f"{combo[0]['Pick']} ({combo[0]['Best Odds']})",
-            "Leg 2": f"{combo[1]['Pick']} ({combo[1]['Best Odds']})",
-            "Leg 3": f"{combo[2]['Pick']} ({combo[2]['Best Odds']})" if legs >= 3 else "",
-            "Leg 4": f"{combo[3]['Pick']} ({combo[3]['Best Odds']})" if legs >= 4 else "",
-        })
+        }
+
+        for i, leg in enumerate(combo, start=1):
+            parlay[f"Leg {i}"] = f"{leg['Sport']} — {leg['Pick']} ({leg['Best Odds']})"
+
+        parlays.append(parlay)
 
     return sorted(parlays, key=lambda x: (x["Estimated Hit %"], x["Total Edge"]), reverse=True)[:max_results]
 
 def render_header():
     st.markdown("""
-    <div class="cd-header">
-        <div class="cd-logo">CD BETTING</div>
-        <div class="cd-subtitle">Sharp betting dashboard • Edge scanner • Arbitrage • Parlays</div>
+    <div class="hero">
+        <div class="logo">CD BETTING</div>
+        <div class="subtitle">Sharp picks • Live odds • Edge board • Parlays</div>
     </div>
     """, unsafe_allow_html=True)
 
-def render_nav():
-    page = st.radio(
-        "Navigation",
-        ["Dashboard", "Value Scanner", "Fight Hub", "Arbitrage", "Parlay Builder", "Summary"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    return page
-
-def metric_card(label, value):
+def render_metric(label, value):
     st.markdown(f"""
-    <div class="metric-card">
+    <div class="metric">
         <div class="metric-label">{label}</div>
         <div class="metric-value">{value}</div>
     </div>
     """, unsafe_allow_html=True)
 
-def render_links(row):
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1: st.link_button("📰 News", row["Google News"])
-    with c2: st.link_button("🏙 Local", row["Local News"])
-    with c3: st.link_button("🚑 Injuries", row["Injuries"])
-    with c4: st.link_button("📊 Preview", row["Preview"])
-    with c5: st.link_button("ESPN", row["ESPN"])
-    with c6: st.link_button("CBS", row["CBS"])
-
 def render_bet_card(row):
-    tag = "tag-red" if "BET NOW" in row["Rating"] else "tag-silver"
+    rating = row["Rating"]
+    card_class = "pick-card-gray"
+    badge = "badge-gray"
+
+    if "BET NOW" in rating:
+        card_class = "pick-card-red"
+        badge = "badge-red"
+    elif "WATCH" in rating:
+        card_class = "pick-card-blue"
+        badge = "badge-blue"
+
     st.markdown(f"""
-    <div class="bet-card">
-        <span class="{tag}">{row['Rating']}</span>
-        <h3>{row['Sport']} — {row['Pick']}</h3>
-        <p><b>Market:</b> {row['Market']} | <b>Edge:</b> {row['Edge %']}% | <b>Suggested:</b> {row['Suggested Units']} units</p>
-        <p><b>Best Odds:</b> {row['Best Odds']} at <b>{row['Best Book']}</b></p>
-        <p><b>Matchup:</b> {row['Matchup']}</p>
-        <p><b>Time:</b> {row['Game Time']}</p>
-        <p><b>Status:</b> {row['Live Score']}</p>
+    <div class="pick-card {card_class}">
+        <span class="{badge}">{rating}</span>
+        <div class="card-title">{row['Sport']} • {row['Pick']}</div>
+        <div class="card-sub">{row['Matchup']}</div>
+        <div class="stat-line">
+            <span class="stat-pill">Edge {row['Edge %']}%</span>
+            <span class="stat-pill">Odds {row['Best Odds']}</span>
+            <span class="stat-pill">{row['Best Book']}</span>
+            <span class="stat-pill">{row['Game Time']}</span>
+            <span class="stat-pill">{row['Market']}</span>
+        </div>
+        <div class="card-sub" style="margin-top:10px;">{row['Live Score']}</div>
+        <div class="link-row">
+            <a href="{row['News']}" target="_blank">News</a>
+            <a href="{row['Local']}" target="_blank">Local</a>
+            <a href="{row['Preview']}" target="_blank">Preview</a>
+            <a href="{row['Injuries']}" target="_blank">Injuries</a>
+        </div>
     </div>
     """, unsafe_allow_html=True)
-    render_links(row)
 
 def show_matchup_breakdowns(df):
     for matchup in df["Matchup"].unique():
         matchup_df = df[df["Matchup"] == matchup].sort_values("Edge %", ascending=False)
         first = matchup_df.iloc[0]
 
-        with st.expander(f"{first['Sport']} — {matchup} | {first['Game Time']}"):
-            st.write(f"**Live score/status:** {first['Live Score']}")
-            render_links(first)
+        with st.expander(f"{first['Sport']} • {matchup} • {first['Game Time']}"):
+            st.write(f"**Live status:** {first['Live Score']}")
+            st.link_button("News", first["News"])
+            st.link_button("Local Team News", first["Local"])
+            st.link_button("Preview", first["Preview"])
+            st.link_button("Injuries", first["Injuries"])
 
-            st.subheader("All Betting Categories")
             st.dataframe(
                 matchup_df[[
                     "Market", "Pick", "Best Odds", "Best Book",
@@ -454,25 +601,28 @@ def show_matchup_breakdowns(df):
                 use_container_width=True,
             )
 
-            st.subheader("Best Plays")
-            for _, row in matchup_df.head(5).iterrows():
-                render_bet_card(row)
-
-
 render_header()
-page = render_nav()
 
-last_updated = datetime.now(ZoneInfo("America/Chicago")).strftime("%B %d, %Y • %I:%M %p CT")
+st.markdown('<div class="nav-wrap">', unsafe_allow_html=True)
+page = st.radio(
+    "Navigation",
+    ["Dashboard", "Value Scanner", "Fight Hub", "Arbitrage", "Parlay Builder", "Summary"],
+    horizontal=True,
+    label_visibility="collapsed"
+)
+st.markdown('</div>', unsafe_allow_html=True)
+
+last_updated = datetime.now(ZoneInfo("America/Chicago")).strftime("%b %d • %I:%M %p CT")
 st.caption(f"Last updated: {last_updated}")
 
 if page == "Dashboard":
-    st.header("Top 20 Best Edge Bets Across All Sports")
+    st.header("Top 20 Edge Picks")
 
-    with st.spinner("Loading top 20 edge board..."):
+    with st.spinner("Loading top picks..."):
         results, errors = scan_all_sports()
 
     if errors:
-        with st.expander("Skipped / unavailable sports or markets"):
+        with st.expander("Skipped / unavailable"):
             for e in errors:
                 st.warning(e)
 
@@ -482,64 +632,33 @@ if page == "Dashboard":
         df = pd.DataFrame(results).sort_values("Edge %", ascending=False).head(20)
 
         c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            metric_card("🔥 BET NOW", len(df[df["Rating"].str.contains("BET NOW")]))
-        with c2:
-            metric_card("👀 WATCH", len(df[df["Rating"].str.contains("WATCH")]))
-        with c3:
-            metric_card("🎯 BEST EDGE", f"{df['Edge %'].max()}%")
-        with c4:
-            metric_card("📋 PICKS", len(df))
+        with c1: render_metric("BET NOW", len(df[df["Rating"].str.contains("BET NOW")]))
+        with c2: render_metric("WATCH", len(df[df["Rating"].str.contains("WATCH")]))
+        with c3: render_metric("BEST EDGE", f"{df['Edge %'].max()}%")
+        with c4: render_metric("PICKS", len(df))
 
-        st.subheader("Edge Board")
-        st.dataframe(df, use_container_width=True)
-
-        st.subheader("Cards")
+        st.subheader("Best Picks")
         for _, row in df.iterrows():
             render_bet_card(row)
 
+        st.subheader("Full Edge Board")
+        st.dataframe(df, use_container_width=True)
+
         st.subheader("Matchup Breakdowns")
         show_matchup_breakdowns(df)
-        if errors:
-            with st.expander("Skipped / unavailable sports or markets"):
-                for e in errors:
-                    st.warning(e)
-
-        if not results:
-            st.warning("No value spots found.")
-        else:
-            df = pd.DataFrame(results).sort_values("Edge %", ascending=False).head(20)
-
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: metric_card("🔥 BET NOW", len(df[df["Rating"].str.contains("BET NOW")]))
-            with c2: metric_card("👀 WATCH", len(df[df["Rating"].str.contains("WATCH")]))
-            with c3: metric_card("🎯 BEST EDGE", f"{df['Edge %'].max()}%")
-            with c4: metric_card("📋 PICKS", len(df))
-
-            st.subheader("Edge Board")
-            st.dataframe(df, use_container_width=True)
-
-            st.subheader("Cards")
-            for _, row in df.iterrows():
-                render_bet_card(row)
-
-            st.subheader("Matchup Breakdowns")
-            show_matchup_breakdowns(df)
 
 elif page == "Value Scanner":
-    st.header("Single Sport Value Scanner")
+    st.header("Value Scanner")
 
     sport_name = st.selectbox("Choose Sport", list(SPORTS.keys()))
     info = SPORTS[sport_name]
-
     selected_markets = st.multiselect("Markets", info["markets"], default=info["markets"])
     min_edge = st.slider("Minimum Edge %", 0.0, 10.0, 1.0, 0.25)
     top_n = st.slider("Picks to show", 5, 100, 20, 5)
-    show_only_watch = st.checkbox("Only WATCH / BET NOW", value=False)
+    only_watch = st.checkbox("Only WATCH / BET NOW", value=False)
 
     if st.button("Scan Sport"):
-        with st.spinner("Scanning..."):
-            results, error = scan_sport(sport_name, info["key"], selected_markets)
+        results, error = scan_sport(sport_name, info["key"], selected_markets)
 
         if error:
             st.error(error)
@@ -549,12 +668,14 @@ elif page == "Value Scanner":
             df = pd.DataFrame(results)
             df = df[df["Edge %"] >= min_edge]
 
-            if show_only_watch:
+            if only_watch:
                 df = df[df["Rating"] != "PASS"]
 
             df = df.sort_values("Edge %", ascending=False).head(top_n)
 
-            st.dataframe(df, use_container_width=True)
+            for _, row in df.iterrows():
+                render_bet_card(row)
+
             show_matchup_breakdowns(df)
 
 elif page == "Fight Hub":
@@ -573,7 +694,8 @@ elif page == "Fight Hub":
             st.warning("No fight props found right now.")
         else:
             df = pd.DataFrame(results).sort_values("Edge %", ascending=False)
-            st.dataframe(df, use_container_width=True)
+            for _, row in df.head(40).iterrows():
+                render_bet_card(row)
             show_matchup_breakdowns(df)
 
 elif page == "Arbitrage":
@@ -593,7 +715,7 @@ elif page == "Arbitrage":
             errors = [error] if error else []
 
         if errors:
-            with st.expander("Skipped / unavailable"):
+            with st.expander("Skipped"):
                 for e in errors:
                     if e:
                         st.warning(e)
@@ -601,30 +723,27 @@ elif page == "Arbitrage":
         if not arbs:
             st.warning("No arbitrage found.")
         else:
-            df = pd.DataFrame(arbs).head(25)
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(pd.DataFrame(arbs).head(25), use_container_width=True)
 
 elif page == "Parlay Builder":
     st.header("Parlay Builder")
-    st.caption("Builds possible parlays from higher edge picks. This is not a guarantee.")
 
     legs = st.selectbox("Parlay Legs", [2, 3, 4], index=1)
-    scan_scope = st.selectbox("Scan", ["All Sports", "Single Sport"])
+    scope = st.selectbox("Scan", ["All Sports", "Single Sport"])
 
-    if scan_scope == "Single Sport":
+    if scope == "Single Sport":
         sport_name = st.selectbox("Choose Sport", list(SPORTS.keys()))
         info = SPORTS[sport_name]
 
     if st.button("Build Parlays"):
-        with st.spinner("Finding parlay combinations..."):
-            if scan_scope == "All Sports":
-                results, errors = scan_all_sports()
-            else:
-                results, error = scan_sport(sport_name, info["key"], info["markets"])
-                errors = [error] if error else []
+        if scope == "All Sports":
+            results, errors = scan_all_sports()
+        else:
+            results, error = scan_sport(sport_name, info["key"], info["markets"])
+            errors = [error] if error else []
 
         if not results:
-            st.warning("No picks available for parlays.")
+            st.warning("No picks available.")
         else:
             df = pd.DataFrame(results)
             parlays = build_parlays(df, legs=legs, max_results=15)
@@ -632,8 +751,7 @@ elif page == "Parlay Builder":
             if not parlays:
                 st.warning("No clean parlay combinations found.")
             else:
-                parlay_df = pd.DataFrame(parlays)
-                st.dataframe(parlay_df, use_container_width=True)
+                st.dataframe(pd.DataFrame(parlays), use_container_width=True)
 
 elif page == "Summary":
     st.header("How to Read CD Betting")
@@ -650,9 +768,12 @@ elif page == "Summary":
     """)
 
     st.subheader("Arbitrage")
-    st.write("Arbitrage looks for markets where best prices across books total under 100% implied probability.")
+    st.write("Arbitrage looks for markets where the best prices across books total under 100% implied probability.")
 
     st.subheader("Parlay Builder")
     st.write("The parlay page combines higher-edge picks while avoiding multiple legs from the same matchup.")
+
+    st.subheader("Downloadable App")
+    st.write("Open the Streamlit URL on your phone, tap Share, then Add to Home Screen. Name it CD Betting.")
 
     st.warning("Research tool only. No pick is guaranteed.")
