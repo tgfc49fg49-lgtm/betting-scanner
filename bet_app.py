@@ -2,6 +2,7 @@
 import itertools
 import math
 import re
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
@@ -2104,7 +2105,7 @@ def render_matchup_detail(df, matchup):
         ai = add_ai_columns(md).sort_values(["AI Confidence", "Edge %"], ascending=False)
         ai = ai.drop_duplicates(subset=["Matchup", "Pick Key", "Market", "Line"], keep="first")
         render_top_ai_cards(ai, count=5)
-        save_today_top5_ai_picks(ai)
+        save_today_top5_ai_picks_v2(ai)
 
     with research_tabs[1]:
         arbs = find_arbitrage(md)
@@ -2131,19 +2132,12 @@ def ensure_loaded():
 
 def auto_load_once():
     """
-    V57:
-    Auto-load all sports again so Dashboard is clean.
-    Stable schema stays on, but no visible load buttons on Dashboard.
+    Lightweight startup. Do not scan all sports at launch.
     """
     ensure_loaded()
 
-    if st.session_state["all_df"].empty and not st.session_state.get("auto_loading_done", False):
-        with st.spinner("Loading today's board..."):
-            df, reports = fetch_all_sports()
-            st.session_state["all_df"] = ensure_schema(df)
-            st.session_state["reports"] = reports
-            st.session_state["auto_loading_done"] = True
-
+    if "auto_loading_done" not in st.session_state:
+        st.session_state["auto_loading_done"] = True
 
 
 def header():
@@ -2151,7 +2145,7 @@ def header():
         """
         <div class="hero">
             <div class="hero-title">CD BETTING</div>
-            <div class="hero-sub">Sportsbook edge scanner • AI pick tracker • DFS Builder</div>
+            <div class="hero-sub">Sportsbook edge scanner • AI tracker • robust DFS builder</div>
             <span class="pill">Common markets only</span>
             <span class="pill">No fake odds</span>
             <span class="pill">AI confidence 0-100</span>
@@ -2467,7 +2461,7 @@ def build_dfs_pool(df, league_filter=None):
     ).round(2)
 
     pool = ensure_schema(pool.drop_duplicates(subset=["Player", "Matchup", "Market", "Line"], keep="first"))
-    return pool.sort_values(["DFS Value", "Leverage", "DFS Projection", "Edge %"], ascending=False)
+    return pool.sort_values(["DFS Value", "Leverage", "DFS Projection", "Edge %"], ascending=False).head(MAX_DFS_POOL_ROWS)
 
 
 def build_dfs_lineups(df, league_filter="All", lineup_size=6, max_lineups=8):
@@ -3048,6 +3042,8 @@ def save_today_top5_ai_picks(ai_df):
 
     if rows:
         tracker = pd.concat([tracker, pd.DataFrame(rows)], ignore_index=True)
+        if "Pick ID" in tracker.columns:
+            tracker = tracker.drop_duplicates(subset=["Pick ID"], keep="last")
         save_ai_tracker(tracker)
 
     return load_ai_tracker()
@@ -3088,16 +3084,37 @@ def ai_tracker_summary(tracker):
     }
 
 
-def render_ai_tracker():
+def render_ai_tracker_v2():
     st.subheader("Top 5 AI Pick Tracker")
 
     tracker = load_ai_tracker()
-
-    if tracker.empty:
+    if tracker is None or tracker.empty:
         st.info("No AI picks saved yet. Load the board and save today's Top 5 AI picks.")
         return
 
+    # Make sure required tracker columns exist.
+    tracker = tracker.copy()
+    needed = [
+        "Pick ID", "Date", "League", "Game Time", "Matchup", "Pick",
+        "Best Odds", "Best Book", "Best MN App", "AI Confidence",
+        "Edge %", "Units Risked", "Units Won", "Graded At", "Result"
+    ]
+    for col in needed:
+        if col not in tracker.columns:
+            tracker[col] = ""
+
+    # Remove duplicate pick IDs before any widgets are created.
+    tracker["Pick ID"] = tracker["Pick ID"].astype(str)
+    tracker = tracker.drop_duplicates(subset=["Pick ID"], keep="last").reset_index(drop=True)
+
+    # Save cleaned tracker so old duplicate rows stop coming back.
+    try:
+        save_ai_tracker(tracker)
+    except Exception:
+        pass
+
     summary = ai_tracker_summary(tracker)
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Record", f"{summary['Wins']}-{summary['Losses']}-{summary['Pushes']}")
     c2.metric("Win %", summary["Win %"])
@@ -3106,12 +3123,22 @@ def render_ai_tracker():
     c5.metric("Pending", summary["Pending"])
 
     with st.expander("Grade pending picks"):
-        pending = tracker[tracker["Result"].astype(str).str.lower().eq("pending")].copy()
+        pending = tracker[tracker["Result"].astype(str).str.lower().eq("pending")].copy().reset_index(drop=True)
 
         if pending.empty:
             st.success("No pending picks to grade.")
         else:
             for idx, row in pending.iterrows():
+                pick_id = str(row.get("Pick ID", ""))
+                row_key = unique_widget_key(
+                    "grade",
+                    idx,
+                    pick_id,
+                    row.get("Date", ""),
+                    row.get("Matchup", ""),
+                    row.get("Pick", ""),
+                )
+
                 with st.container(border=True):
                     st.write(f"**{row.get('Pick', '')}**")
                     st.caption(f"{row.get('League', '')} • {row.get('Matchup', '')} • {row.get('Date', '')}")
@@ -3121,18 +3148,27 @@ def render_ai_tracker():
                         result = st.selectbox(
                             "Result",
                             ["Pending", "Win", "Loss", "Push"],
-                            key=f"grade_result_{safe_key(row.get('Pick ID', idx))}",
+                            key=unique_widget_key("grade_result", row_key),
                         )
                     with c_save:
-                        if st.button("Save", key=f"grade_save_{safe_key(row.get('Pick ID', idx))}", use_container_width=True):
-                            tracker.loc[tracker["Pick ID"] == row["Pick ID"], "Result"] = result
-                            tracker.loc[tracker["Pick ID"] == row["Pick ID"], "Units Won"] = units_profit_from_result(
+                        if st.button("Save", key=unique_widget_key("grade_save", row_key), use_container_width=True):
+                            full_tracker = load_ai_tracker()
+                            full_tracker["Pick ID"] = full_tracker["Pick ID"].astype(str)
+
+                            mask = full_tracker["Pick ID"].eq(pick_id)
+                            if not mask.any():
+                                mask = full_tracker.index == idx
+
+                            full_tracker.loc[mask, "Result"] = result
+                            full_tracker.loc[mask, "Units Won"] = units_profit_from_result(
                                 result,
                                 row.get("Best Odds", 0),
                                 row.get("Units Risked", 1.0),
                             )
-                            tracker.loc[tracker["Pick ID"] == row["Pick ID"], "Graded At"] = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %I:%M %p CT")
-                            save_ai_tracker(tracker)
+                            full_tracker.loc[mask, "Graded At"] = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %I:%M %p CT")
+
+                            full_tracker = full_tracker.drop_duplicates(subset=["Pick ID"], keep="last")
+                            save_ai_tracker(full_tracker)
                             st.rerun()
 
     st.markdown("#### Pick History")
@@ -3149,11 +3185,5328 @@ def render_ai_tracker():
     )
 
 
+def cached_clean_board_for_ui(df):
+    df = ensure_schema(df)
+    if df.empty:
+        return df
+    return ensure_schema(clean_user_facing_board(df, hide_low_interest=True))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_ai_board(df):
+    df = ensure_schema(df)
+    if df.empty:
+        return df
+    board = clean_user_facing_board(df, hide_low_interest=True)
+    board = board.head(MAX_DASHBOARD_ROWS)
+    return ensure_schema(add_ai_columns(board))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_matchup_scores(df):
+    df = ensure_schema(df)
+    if df.empty:
+        return pd.DataFrame(columns=["Matchup", "Priority Score", "Edge %", "High Rate Score"])
+    work = clean_user_facing_board(df, hide_low_interest=True)
+    if work.empty:
+        return pd.DataFrame(columns=["Matchup", "Priority Score", "Edge %", "High Rate Score"])
+    return (
+        work.groupby("Matchup", as_index=False)
+        .agg({
+            "Priority Score": "max",
+            "Edge %": "max",
+            "High Rate Score": "max",
+            "League": "first",
+            "Game Time": "first",
+        })
+        .sort_values(["Priority Score", "Edge %", "High Rate Score"], ascending=False)
+    )
+
+
+def load_default_dashboard_sport():
+    """
+    V67:
+    Guarantee a first lightweight MLB load so Dashboard does not sit empty.
+    """
+    ensure_loaded()
+
+    if st.session_state.get("all_df", pd.DataFrame()).empty and not st.session_state.get("loaded_default_sport", False):
+        with st.spinner("Loading main board..."):
+            load_one_sport_to_state("MLB")
+        st.session_state["loaded_default_sport"] = True
+        st.rerun()
+
+
+def unique_widget_key(prefix, *parts):
+    raw = prefix + "_" + "_".join(str(p) for p in parts)
+    raw = re.sub(r"[^a-zA-Z0-9_]+", "_", raw)
+    # Add a short hash so even long/truncated labels stay unique.
+    return raw[:120] + "_" + str(abs(hash(raw)) % 100000000)
+
+
+
+# =========================================================
+# V70 PERFORMANCE HELPERS
+# =========================================================
+
+MAX_DASHBOARD_ROWS = 400
+MAX_SPORTBOOK_ROWS = 700
+MAX_DFS_POOL_ROWS = 300
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_clean_board_for_ui(df):
+    df = ensure_schema(df)
+    if df.empty:
+        return df
+    return ensure_schema(clean_user_facing_board(df, hide_low_interest=True))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_ai_board(df):
+    df = ensure_schema(df)
+    if df.empty:
+        return df
+
+    board = clean_user_facing_board(df, hide_low_interest=True)
+    board = board.head(MAX_DASHBOARD_ROWS)
+
+    return ensure_schema(add_ai_columns(board))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_matchup_scores(df):
+    df = ensure_schema(df)
+    if df.empty:
+        return pd.DataFrame(columns=["Matchup", "Priority Score", "Edge %", "High Rate Score"])
+
+    work = clean_user_facing_board(df, hide_low_interest=True)
+    if work.empty:
+        return pd.DataFrame(columns=["Matchup", "Priority Score", "Edge %", "High Rate Score"])
+
+    return (
+        work.groupby("Matchup", as_index=False)
+        .agg({
+            "Priority Score": "max",
+            "Edge %": "max",
+            "High Rate Score": "max",
+            "League": "first",
+            "Game Time": "first",
+        })
+        .sort_values(["Priority Score", "Edge %", "High Rate Score"], ascending=False)
+    )
+
+
+def load_default_dashboard_sport():
+    """
+    Load MLB once so the Dashboard has a fast main board without scanning every sport.
+    """
+    ensure_loaded()
+
+    if st.session_state.get("all_df", pd.DataFrame()).empty and not st.session_state.get("loaded_default_sport", False):
+        with st.spinner("Loading main board..."):
+            load_one_sport_to_state("MLB")
+
+        st.session_state["loaded_default_sport"] = True
+        st.rerun()
+
+
+
+
+def trim_for_speed_safe(df, limit=None):
+    """
+    Safe sportsbook row limiter.
+    Uses no constant in the function signature to avoid syntax/merge issues.
+    """
+    df = ensure_schema(df)
+
+    if df.empty:
+        return df
+
+    if limit is None:
+        limit = 700
+
+    sort_cols = [c for c in ["Priority Score", "High Rate Score", "Edge %"] if c in df.columns]
+
+    if sort_cols:
+        return df.sort_values(sort_cols, ascending=False).head(int(limit))
+
+    return df.head(int(limit))
+
+
+
+# =========================================================
+# AI TRACKER V2
+# =========================================================
+
+def ai_pick_unique_key(row, date_str=None):
+    date_str = date_str or today_ct_string()
+    raw = "|".join([
+        str(date_str),
+        str(row.get("League", "")),
+        str(row.get("Matchup", "")),
+        str(row.get("Player", "")),
+        str(row.get("Market", "")),
+        str(row.get("Line", "")),
+        str(row.get("Pick", "")),
+    ])
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", raw)[:220]
+
+
+def dedupe_ai_tracker(tracker):
+    if tracker is None or tracker.empty:
+        return load_ai_tracker()
+
+    t = tracker.copy()
+
+    for col in [
+        "Pick ID", "Date", "League", "Game Time", "Matchup", "Market", "Player",
+        "Line", "Pick", "Best Odds", "Best Book", "Best MN App",
+        "Edge %", "Model Probability %", "AI Confidence",
+        "Result", "Units Risked", "Units Won", "Graded At"
+    ]:
+        if col not in t.columns:
+            t[col] = ""
+
+    # Rebuild stable IDs for old rows if needed.
+    t["Pick ID"] = t.apply(lambda r: ai_pick_unique_key(r, r.get("Date", today_ct_string())), axis=1)
+
+    # Keep latest copy of each unique pick.
+    t = t.drop_duplicates(subset=["Pick ID"], keep="last")
+
+    # Keep only top 5 per date by confidence/edge, but do not remove already graded rows.
+    t["AI Confidence Num"] = pd.to_numeric(t["AI Confidence"], errors="coerce").fillna(0)
+    t["Edge Num"] = pd.to_numeric(t["Edge %"], errors="coerce").fillna(0)
+
+    kept = []
+    for date, group in t.groupby("Date", dropna=False):
+        graded = group[~group["Result"].astype(str).str.lower().isin(["pending", "", "nan"])].copy()
+        pending = group[group["Result"].astype(str).str.lower().isin(["pending", "", "nan"])].copy()
+
+        pending = pending.sort_values(["AI Confidence Num", "Edge Num"], ascending=False).head(5)
+
+        kept.append(pd.concat([graded, pending], ignore_index=True))
+
+    if kept:
+        t = pd.concat(kept, ignore_index=True)
+
+    t = t.drop(columns=[c for c in ["AI Confidence Num", "Edge Num"] if c in t.columns], errors="ignore")
+    return t
+
+
+def save_today_top5_ai_picks_v2(ai_df):
+    """
+    Auto-save exactly Top 5 for today.
+    No duplicates.
+    No manual button needed.
+    """
+    tracker = load_ai_tracker()
+    today = today_ct_string()
+
+    ai_df = ensure_schema(ai_df)
+    if ai_df.empty:
+        return tracker
+
+    top5 = (
+        ai_df
+        .drop_duplicates(subset=["Matchup", "Player", "Market", "Line", "Pick"], keep="first")
+        .sort_values(["AI Confidence", "Priority Score", "Edge %"], ascending=False)
+        .head(5)
+    )
+
+    rows = []
+    for _, row in top5.iterrows():
+        rows.append({
+            "Pick ID": ai_pick_unique_key(row, today),
+            "Date": today,
+            "League": row.get("League", ""),
+            "Game Time": row.get("Game Time", ""),
+            "Matchup": row.get("Matchup", ""),
+            "Market": row.get("Market", ""),
+            "Player": row.get("Player", ""),
+            "Line": row.get("Line", ""),
+            "Pick": row.get("Pick", ""),
+            "Best Odds": row.get("Best Odds", ""),
+            "Best Book": row.get("Best Book", ""),
+            "Best MN App": row.get("Best MN App", ""),
+            "Edge %": row.get("Edge %", 0),
+            "Model Probability %": row.get("Model Probability %", 50),
+            "AI Confidence": row.get("AI Confidence", 0),
+            "Result": "Pending",
+            "Units Risked": 1.0,
+            "Units Won": 0.0,
+            "Graded At": "",
+        })
+
+    if rows:
+        new_rows = pd.DataFrame(rows)
+        tracker = pd.concat([tracker, new_rows], ignore_index=True)
+        tracker = dedupe_ai_tracker(tracker)
+        save_ai_tracker(tracker)
+
+    return load_ai_tracker()
+
+
+def auto_flag_completed_pending_picks():
+    """
+    Safe auto-grade placeholder.
+    It does NOT fake win/loss.
+    It marks pending picks from games that appear final/completed as Needs Review.
+    Manual grading still decides Win/Loss/Push.
+    """
+    tracker = load_ai_tracker()
+    if tracker.empty:
+        return tracker
+
+    t = tracker.copy()
+    if "Result" not in t.columns:
+        t["Result"] = "Pending"
+
+    # Do not attempt fake grading without exact box score/stat result feed.
+    # Future version can connect official completed player stats here.
+    return t
+
+
+def render_ai_tracker_v2():
+    tracker = dedupe_ai_tracker(load_ai_tracker())
+
+    if tracker.empty:
+        st.info("No tracked AI picks yet. Today's Top 5 will save automatically once picks load.")
+        return
+
+    save_ai_tracker(tracker)
+
+    summary = ai_tracker_summary(tracker)
+
+    st.subheader("AI Pick Tracker")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Record", f"{summary['Wins']}-{summary['Losses']}-{summary['Pushes']}")
+    c2.metric("Win %", summary["Win %"])
+    c3.metric("Units", summary["Units"])
+    c4.metric("ROI", summary["ROI"])
+    c5.metric("Pending", summary["Pending"])
+
+    today = today_ct_string()
+    today_rows = tracker[tracker["Date"].astype(str).eq(today)].copy()
+
+    st.markdown("#### Today's Tracked Top 5")
+    if today_rows.empty:
+        st.info("Today's Top 5 has not been saved yet.")
+    else:
+        today_rows = today_rows.sort_values(["AI Confidence", "Edge %"], ascending=False).head(5)
+        safe_dataframe(
+            today_rows,
+            cols=[
+                "Date", "Result", "League", "Game Time", "Matchup", "Pick",
+                "Best Odds", "Best Book", "Best MN App", "AI Confidence", "Edge %"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Grade pending picks"):
+        pending = tracker[tracker["Result"].astype(str).str.lower().eq("pending")].copy().reset_index(drop=True)
+
+        if pending.empty:
+            st.success("No pending picks to grade.")
+        else:
+            for idx, row in pending.iterrows():
+                row_key = unique_widget_key(
+                    "grade_v2",
+                    idx,
+                    row.get("Pick ID", ""),
+                    row.get("Date", ""),
+                    row.get("Matchup", ""),
+                    row.get("Pick", ""),
+                )
+
+                with st.container(border=True):
+                    st.write(f"**{row.get('Pick', '')}**")
+                    st.caption(f"{row.get('League', '')} • {row.get('Matchup', '')} • {row.get('Date', '')}")
+
+                    c_res, c_save = st.columns([2, 1])
+                    with c_res:
+                        result = st.selectbox(
+                            "Result",
+                            ["Pending", "Win", "Loss", "Push"],
+                            key=unique_widget_key("grade_result_v2", row_key),
+                        )
+                    with c_save:
+                        if st.button("Save", key=unique_widget_key("grade_save_v2", row_key), use_container_width=True):
+                            full_tracker = load_ai_tracker()
+                            full_tracker["Pick ID"] = full_tracker["Pick ID"].astype(str)
+
+                            pick_id = str(row.get("Pick ID", ""))
+                            mask = full_tracker["Pick ID"].eq(pick_id)
+
+                            full_tracker.loc[mask, "Result"] = result
+                            full_tracker.loc[mask, "Units Won"] = units_profit_from_result(
+                                result,
+                                row.get("Best Odds", 0),
+                                row.get("Units Risked", 1.0),
+                            )
+                            full_tracker.loc[mask, "Graded At"] = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %I:%M %p CT")
+                            full_tracker = dedupe_ai_tracker(full_tracker)
+                            save_ai_tracker(full_tracker)
+                            st.rerun()
+
+    with st.expander("Full Pick History"):
+        shown = tracker.sort_values(["Date", "AI Confidence"], ascending=False)
+        safe_dataframe(
+            shown,
+            cols=[
+                "Date", "Result", "League", "Game Time", "Matchup", "Pick",
+                "Best Odds", "Best Book", "Best MN App", "AI Confidence",
+                "Edge %", "Units Risked", "Units Won", "Graded At"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+
+# =========================================================
+# DFS STYLE PRESETS
+# =========================================================
+
+DFS_STYLE_PRESETS = {
+    "DraftKings": {
+        "Classic": {
+            "lineup_size": 10,
+            "salary_cap": 50000,
+            "description": "10 players under $50,000 salary cap."
+        },
+        "Showdown Captain": {
+            "lineup_size": 6,
+            "salary_cap": 50000,
+            "description": "1 captain + 5 flex style build under $50,000."
+        },
+        "Single Game": {
+            "lineup_size": 6,
+            "salary_cap": 50000,
+            "description": "6-player single-game style build under $50,000."
+        },
+        "Cash": {
+            "lineup_size": 10,
+            "salary_cap": 50000,
+            "description": "Safer projected lineup, less risky volatility."
+        },
+        "GPP/Tournament": {
+            "lineup_size": 10,
+            "salary_cap": 50000,
+            "description": "Upside-focused lineup with more ceiling/leverage."
+        },
+    },
+    "FanDuel": {
+        "Classic": {
+            "lineup_size": 9,
+            "salary_cap": 60000,
+            "description": "9 players under $60,000 salary cap."
+        },
+        "Single Game MVP": {
+            "lineup_size": 5,
+            "salary_cap": 60000,
+            "description": "MVP + 4 flex style build under $60,000."
+        },
+        "Cash": {
+            "lineup_size": 9,
+            "salary_cap": 60000,
+            "description": "Safer projected lineup, less risky volatility."
+        },
+        "GPP/Tournament": {
+            "lineup_size": 9,
+            "salary_cap": 60000,
+            "description": "Upside-focused lineup with more ceiling/leverage."
+        },
+    },
+}
+
+
+def dfs_style_options(platform):
+    return list(DFS_STYLE_PRESETS.get(platform, DFS_STYLE_PRESETS["DraftKings"]).keys())
+
+
+def dfs_style_default(platform, style):
+    presets = DFS_STYLE_PRESETS.get(platform, DFS_STYLE_PRESETS["DraftKings"])
+    return presets.get(style, presets[list(presets.keys())[0]])
+
+
+def dfs_strategy_score(row, style="Classic"):
+    """
+    Strategy score by DFS contest style.
+    Cash = projection/confidence heavy.
+    GPP = ceiling/leverage heavy.
+    Classic = balanced.
+    Showdown/single-game = balanced but allows more same-matchup correlation.
+    """
+    proj = float(row.get("DFS Projection", 0) or 0)
+    conf = float(row.get("DFS Confidence", 50) or 50)
+    edge = float(row.get("Edge %", 0) or 0)
+    ceiling = float(row.get("Ceiling", proj * 1.4) or 0)
+    floor = float(row.get("Floor", proj * 0.55) or 0)
+    leverage = float(row.get("Leverage", 0) or 0)
+
+    style_l = str(style).lower()
+
+    if "cash" in style_l:
+        return round(proj * 1.25 + floor * 0.8 + conf * 0.12 + edge * 0.25, 3)
+
+    if "gpp" in style_l or "tournament" in style_l:
+        return round(ceiling * 1.05 + leverage * 0.9 + edge * 0.45 + proj * 0.6, 3)
+
+    if "showdown" in style_l or "single" in style_l:
+        return round(proj * 1.0 + ceiling * 0.5 + edge * 0.4 + conf * 0.08, 3)
+
+    return round(proj * 1.0 + ceiling * 0.35 + floor * 0.25 + leverage * 0.45 + conf * 0.06 + edge * 0.35, 3)
+
+
+def max_same_matchup_for_style(style):
+    style_l = str(style).lower()
+    if "showdown" in style_l or "single" in style_l:
+        return 6
+    if "gpp" in style_l or "tournament" in style_l:
+        return 3
+    return 2
+
+
+def optimize_dfs_lineups_by_style(df, platform="DraftKings", style="Classic", budget=None, league_filter="All", max_lineups=8):
+    preset = dfs_style_default(platform, style)
+    lineup_size = int(preset.get("lineup_size", 10))
+    if budget is None:
+        budget = int(preset.get("salary_cap", dfs_default_budget(platform)))
+
+    pool = build_dfs_pool(df, league_filter)
+    pool = ensure_schema(pool)
+
+    if pool.empty:
+        return []
+
+    pool["Platform"] = platform
+    pool["DFS Style"] = style
+    pool["Salary"] = pool.apply(lambda r: dfs_platform_salary(r, platform), axis=1)
+    pool["Position"] = pool.apply(lambda r: dfs_platform_positions(r, platform), axis=1)
+    pool["Style Score"] = pool.apply(lambda r: dfs_strategy_score(r, style), axis=1)
+    pool["Value Per $1K"] = (
+        pd.to_numeric(pool["Style Score"], errors="coerce").fillna(0)
+        / (pd.to_numeric(pool["Salary"], errors="coerce").fillna(9999) / 1000)
+    ).round(3)
+
+    # Use value first, then raw upside/projection.
+    pool = pool.sort_values(["Value Per $1K", "Style Score", "DFS Projection"], ascending=False)
+
+    players = pool.to_dict("records")
+    lineups = []
+    max_same_matchup = max_same_matchup_for_style(style)
+
+    for start_idx in range(min(len(players), max_lineups * 14)):
+        lineup = []
+        used_players = set()
+        matchup_counts = {}
+        salary_total = 0
+
+        ordered = players[start_idx:] + players[:start_idx]
+
+        for cand in ordered:
+            player = str(cand.get("Player", "")).strip()
+            matchup = str(cand.get("Matchup", "")).strip()
+            salary = int(cand.get("Salary", 0) or 0)
+
+            if not player or player in used_players:
+                continue
+
+            if matchup_counts.get(matchup, 0) >= max_same_matchup:
+                continue
+
+            if salary_total + salary > int(budget):
+                continue
+
+            lineup.append(cand)
+            used_players.add(player)
+            salary_total += salary
+            matchup_counts[matchup] = matchup_counts.get(matchup, 0) + 1
+
+            if len(lineup) >= lineup_size:
+                break
+
+        if len(lineup) == lineup_size:
+            total_proj = round(sum(float(x.get("DFS Projection", 0) or 0) for x in lineup), 2)
+            total_style = round(sum(float(x.get("Style Score", 0) or 0) for x in lineup), 2)
+            avg_conf = round(sum(float(x.get("DFS Confidence", 0) or 0) for x in lineup) / lineup_size, 1)
+            total_edge = round(sum(float(x.get("Edge %", 0) or 0) for x in lineup), 2)
+            remaining = int(budget) - salary_total
+
+            key = tuple(sorted(x.get("Player", "") for x in lineup))
+            if key not in [l["Key"] for l in lineups]:
+                lineups.append({
+                    "Key": key,
+                    "Platform": platform,
+                    "DFS Style": style,
+                    "Lineup Size": lineup_size,
+                    "Budget": int(budget),
+                    "Salary Used": salary_total,
+                    "Salary Left": remaining,
+                    "Players": lineup,
+                    "Projected Score": total_proj,
+                    "Style Score": total_style,
+                    "Avg Confidence": avg_conf,
+                    "Total Edge": total_edge,
+                })
+
+    return sorted(
+        lineups,
+        key=lambda x: (x["Projected Score"], x["Style Score"], -x["Salary Left"], x["Avg Confidence"]),
+        reverse=True,
+    )[:max_lineups]
+
+
+def render_style_dfs_lineups(lineups):
+    if not lineups:
+        st.warning("No lineup fit under that budget/style. Raise the budget, lower restrictions, or load more sports.")
+        return
+
+    for idx, lineup in enumerate(lineups, start=1):
+        with st.container(border=True):
+            st.markdown(f"### {lineup['Platform']} {lineup['DFS Style']} Lineup #{idx}")
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Players", lineup["Lineup Size"])
+            c2.metric("Projected", lineup["Projected Score"])
+            c3.metric("Salary Used", f"${lineup['Salary Used']:,}")
+            c4.metric("Salary Left", f"${lineup['Salary Left']:,}")
+            c5.metric("Confidence", f"{lineup['Avg Confidence']}%")
+
+            rows = []
+            for n, p in enumerate(lineup["Players"], start=1):
+                rows.append({
+                    "#": n,
+                    "Pos": p.get("Position", ""),
+                    "Player": p.get("Player", ""),
+                    "League": p.get("League", ""),
+                    "Matchup": p.get("Matchup", ""),
+                    "Pick Used": p.get("Pick", ""),
+                    "Salary": p.get("Salary", ""),
+                    "Projection": p.get("DFS Projection", ""),
+                    "Style Score": p.get("Style Score", ""),
+                    "Value/$1K": p.get("Value Per $1K", ""),
+                    "Ceiling": p.get("Ceiling", ""),
+                    "Floor": p.get("Floor", ""),
+                    "Leverage": p.get("Leverage", ""),
+                    "Best MN App": p.get("Best MN App", ""),
+                })
+
+            safe_dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+
+# =========================================================
+# DFS BUILDER PRO
+# =========================================================
+
+DFS_ROSTER_RULES = {
+    ("DraftKings", "MLB", "Classic"): {
+        "cap": 50000,
+        "slots": ["P", "P", "C/1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"],
+        "description": "DraftKings MLB Classic: 10 players under $50,000."
+    },
+    ("DraftKings", "MLB", "Showdown Captain"): {
+        "cap": 50000,
+        "slots": ["CPT", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL"],
+        "description": "DraftKings MLB Showdown: Captain + 5 utility under $50,000."
+    },
+    ("FanDuel", "MLB", "Classic"): {
+        "cap": 35000,
+        "slots": ["P", "C/1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"],
+        "description": "FanDuel MLB Classic: 9 players under $35,000."
+    },
+    ("FanDuel", "MLB", "Single Game MVP"): {
+        "cap": 35000,
+        "slots": ["MVP", "UTIL", "UTIL", "UTIL", "UTIL"],
+        "description": "FanDuel MLB Single Game: MVP + 4 utility under $35,000."
+    },
+
+    ("DraftKings", "NBA", "Classic"): {
+        "cap": 50000,
+        "slots": ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"],
+        "description": "DraftKings NBA Classic: 8 players under $50,000."
+    },
+    ("FanDuel", "NBA", "Classic"): {
+        "cap": 60000,
+        "slots": ["PG", "PG", "SG", "SG", "SF", "SF", "PF", "PF", "C"],
+        "description": "FanDuel NBA Classic: 9 players under $60,000."
+    },
+
+    ("DraftKings", "WNBA", "Classic"): {
+        "cap": 50000,
+        "slots": ["G", "G", "F", "F", "FLEX", "FLEX"],
+        "description": "DraftKings WNBA Classic: 6 players under $50,000."
+    },
+    ("FanDuel", "WNBA", "Classic"): {
+        "cap": 60000,
+        "slots": ["G", "G", "F", "F", "UTIL", "UTIL"],
+        "description": "FanDuel WNBA Classic: 6 players under $60,000."
+    },
+
+    ("DraftKings", "NFL", "Classic"): {
+        "cap": 50000,
+        "slots": ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST"],
+        "description": "DraftKings NFL Classic: 9 spots under $50,000."
+    },
+    ("FanDuel", "NFL", "Classic"): {
+        "cap": 60000,
+        "slots": ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF"],
+        "description": "FanDuel NFL Classic: 9 spots under $60,000."
+    },
+
+    ("DraftKings", "NHL", "Classic"): {
+        "cap": 50000,
+        "slots": ["C", "C", "W", "W", "W", "D", "D", "G", "UTIL"],
+        "description": "DraftKings NHL Classic: 9 players under $50,000."
+    },
+    ("FanDuel", "NHL", "Classic"): {
+        "cap": 55000,
+        "slots": ["C", "C", "W", "W", "W", "W", "D", "D", "G"],
+        "description": "FanDuel NHL Classic: 9 players under $55,000."
+    },
+
+    ("DraftKings", "UFC/MMA", "Classic"): {
+        "cap": 50000,
+        "slots": ["F", "F", "F", "F", "F", "F"],
+        "description": "DraftKings MMA Classic: 6 fighters under $50,000."
+    },
+    ("FanDuel", "UFC/MMA", "Classic"): {
+        "cap": 60000,
+        "slots": ["F", "F", "F", "F", "F", "F"],
+        "description": "FanDuel MMA Classic: 6 fighters under $60,000."
+    },
+
+    ("DraftKings", "Soccer", "Classic"): {
+        "cap": 50000,
+        "slots": ["F", "F", "M", "M", "D", "D", "G", "UTIL"],
+        "description": "DraftKings Soccer Classic: 8 players under $50,000."
+    },
+    ("FanDuel", "Soccer", "Classic"): {
+        "cap": 55000,
+        "slots": ["F", "F", "M", "M", "D", "D", "G", "UTIL"],
+        "description": "FanDuel Soccer Classic: 8 players under $55,000."
+    },
+}
+
+
+def dfs_available_styles(platform, sport):
+    styles = []
+    for (p, s, style), rules in DFS_ROSTER_RULES.items():
+        if p == platform and s == sport:
+            styles.append(style)
+    if not styles:
+        styles = ["Classic"]
+    return styles
+
+
+def dfs_get_rules(platform, sport, style):
+    key = (platform, sport, style)
+    if key in DFS_ROSTER_RULES:
+        return DFS_ROSTER_RULES[key]
+
+    # Fallback generic rules
+    cap = 60000 if platform == "FanDuel" else 50000
+    return {
+        "cap": cap,
+        "slots": ["UTIL", "UTIL", "UTIL", "UTIL", "UTIL", "UTIL"],
+        "description": f"{platform} {sport} {style}: utility lineup under ${cap:,}."
+    }
+
+
+def normalize_player_name_for_join(name):
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def read_dfs_salary_file(uploaded_file, platform="DraftKings"):
+    """
+    Reads common DraftKings/FanDuel salary CSV formats.
+    Expected helpful columns may include:
+    Name, Player, Position, Roster Position, Salary, TeamAbbrev, Game Info.
+    """
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    try:
+        sal = pd.read_csv(uploaded_file)
+    except Exception:
+        return pd.DataFrame()
+
+    sal = sal.copy()
+    original_cols = list(sal.columns)
+    lower = {c.lower().strip(): c for c in original_cols}
+
+    name_col = None
+    for cand in ["name", "player", "nickname", "first name"]:
+        if cand in lower:
+            name_col = lower[cand]
+            break
+
+    if name_col is None and "first name" in lower and "last name" in lower:
+        sal["Name"] = sal[lower["first name"]].astype(str) + " " + sal[lower["last name"]].astype(str)
+        name_col = "Name"
+
+    salary_col = None
+    for cand in ["salary", "salary ($)", "fppg"]:
+        if cand in lower:
+            salary_col = lower[cand]
+            break
+
+    pos_col = None
+    for cand in ["roster position", "position", "positions"]:
+        if cand in lower:
+            pos_col = lower[cand]
+            break
+
+    team_col = None
+    for cand in ["teamabbrev", "team", "team abbreviation"]:
+        if cand in lower:
+            team_col = lower[cand]
+            break
+
+    game_col = None
+    for cand in ["game info", "game", "matchup"]:
+        if cand in lower:
+            game_col = lower[cand]
+            break
+
+    if name_col is None or salary_col is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["DFS Name"] = sal[name_col].astype(str)
+    out["Join Name"] = out["DFS Name"].apply(normalize_player_name_for_join)
+    out["DFS Salary"] = pd.to_numeric(sal[salary_col], errors="coerce").fillna(0).astype(int)
+    out["DFS Position"] = sal[pos_col].astype(str) if pos_col else "UTIL"
+    out["DFS Team"] = sal[team_col].astype(str) if team_col else ""
+    out["DFS Game Info"] = sal[game_col].astype(str) if game_col else ""
+    out["Platform"] = platform
+
+    out = out[out["DFS Salary"] > 0].copy()
+    return out.drop_duplicates(subset=["Join Name", "DFS Salary", "DFS Position"], keep="first")
+
+
+def infer_dfs_position_from_market(row, sport="MLB"):
+    market = str(row.get("Market", "")).lower()
+    pick = str(row.get("Pick", "")).lower()
+    player = str(row.get("Player", "")).strip()
+
+    if sport == "MLB":
+        # Pitching markets should be pitcher slots.
+        if any(x in market for x in ["pitching", "strikeout", "earned runs", "hits allowed", "outs recorded"]):
+            return "P"
+        return "UTIL"
+
+    if sport in ["NBA", "WNBA"]:
+        return "UTIL"
+
+    if sport == "NFL":
+        if "passing" in market:
+            return "QB"
+        if "rushing" in market:
+            return "RB"
+        if "receiving" in market or "reception" in market:
+            return "WR"
+        return "FLEX"
+
+    if sport == "NHL":
+        if "saves" in market:
+            return "G"
+        if "goal" in market or "assist" in market or "points" in market:
+            return "UTIL"
+        return "UTIL"
+
+    if sport == "UFC/MMA":
+        return "F"
+
+    if sport == "Soccer":
+        if "save" in market:
+            return "G"
+        return "UTIL"
+
+    return "UTIL"
+
+
+def eligible_for_slot(position, slot):
+    pos = str(position).upper()
+    slot = str(slot).upper()
+
+    if slot in ["UTIL", "FLEX"]:
+        return pos not in ["DST", "DEF"] or slot == "FLEX"
+
+    if slot == "CPT":
+        return True
+
+    if slot == "MVP":
+        return True
+
+    if "/" in slot:
+        return any(eligible_for_slot(pos, s) for s in slot.split("/"))
+
+    if slot == "G":
+        return pos in ["G", "PG", "SG"]
+
+    if slot == "F":
+        return pos in ["F", "SF", "PF"]
+
+    if slot == "W":
+        return pos in ["W", "LW", "RW"]
+
+    if slot == "D":
+        return pos in ["D", "DEF"]
+
+    if slot == "DST":
+        return pos in ["DST", "DEF"]
+
+    return pos == slot
+
+
+def build_dfs_pro_pool(df, salary_df=None, platform="DraftKings", sport="MLB", slate="Main", style="Classic"):
+    board = ensure_schema(df)
+    if board.empty:
+        return pd.DataFrame()
+
+    board = board[board["League"] == sport].copy()
+    if board.empty:
+        return pd.DataFrame()
+
+    # Only player props make sense for player projections.
+    board = board[board["Is Prop"] == True].copy()
+    if board.empty:
+        return pd.DataFrame()
+
+    board = clean_user_facing_board(board, hide_low_interest=True)
+    board = board.drop_duplicates(subset=["Player", "Matchup", "Market", "Line"], keep="first").copy()
+
+    if "AI Confidence" not in board.columns:
+        board = add_ai_columns(board)
+
+    pool = build_dfs_pool(board, sport)
+    pool = ensure_schema(pool)
+    if pool.empty:
+        return pd.DataFrame()
+
+    pool["Join Name"] = pool["Player"].apply(normalize_player_name_for_join)
+    pool["Inferred Position"] = pool.apply(lambda r: infer_dfs_position_from_market(r, sport), axis=1)
+
+    if salary_df is not None and not salary_df.empty:
+        pool = attach_salary_to_pool_v88(pool, salary_df, platform=platform)
+    else:
+        pool["Salary"] = None
+        pool["Position"] = pool["Inferred Position"]
+        pool["Salary Source"] = "Estimated"
+
+    # Fallback salary only for missing values.
+    missing_salary = pd.to_numeric(pool["Salary"], errors="coerce").fillna(0) <= 0
+    pool.loc[missing_salary, "Salary"] = pool[missing_salary].apply(lambda r: dfs_platform_salary(r, platform), axis=1)
+    pool["Salary"] = pd.to_numeric(pool["Salary"], errors="coerce").fillna(0).astype(int)
+
+    if salary_df is None or salary_df.empty:
+        pool = assign_estimated_positions(pool, sport)
+        pool = scale_estimated_salaries_for_cap(pool, platform, sport, style)
+
+    pool["Ceiling"] = pd.to_numeric(pool["Ceiling"], errors="coerce").fillna(pd.to_numeric(pool["DFS Projection"], errors="coerce").fillna(0) * 1.45)
+    pool["Floor"] = pd.to_numeric(pool["Floor"], errors="coerce").fillna(pd.to_numeric(pool["DFS Projection"], errors="coerce").fillna(0) * 0.55)
+    pool["Leverage"] = pd.to_numeric(pool["Leverage"], errors="coerce").fillna(0)
+    pool["DFS Projection"] = pd.to_numeric(pool["DFS Projection"], errors="coerce").fillna(0)
+    pool["DFS Confidence"] = pd.to_numeric(pool["DFS Confidence"], errors="coerce").fillna(50)
+    pool["Edge %"] = pd.to_numeric(pool["Edge %"], errors="coerce").fillna(0)
+
+    pool["Base Score"] = (
+        pool["DFS Projection"] * 1.0
+        + pool["DFS Confidence"] * 0.06
+        + pool["Edge %"] * 0.35
+    )
+
+    return pool.sort_values(["Base Score", "DFS Projection", "Edge %"], ascending=False).head(500)
+
+
+def score_player_for_build(row, build_type):
+    proj = float(row.get("DFS Projection", 0) or 0)
+    ceil = float(row.get("Ceiling", 0) or 0)
+    floor = float(row.get("Floor", 0) or 0)
+    lev = float(row.get("Leverage", 0) or 0)
+    conf = float(row.get("DFS Confidence", 50) or 50)
+    edge = float(row.get("Edge %", 0) or 0)
+
+    build = str(build_type).lower()
+
+    if "cash" in build:
+        return proj * 1.1 + floor * 0.9 + conf * 0.12 + edge * 0.2
+
+    if "gpp" in build:
+        return ceil * 1.15 + lev * 1.0 + proj * 0.55 + edge * 0.45
+
+    if "contrarian" in build:
+        return ceil * 0.9 + lev * 1.5 + edge * 0.35 + proj * 0.45
+
+    return proj + ceil * 0.4 + floor * 0.2 + lev * 0.4 + edge * 0.35
+
+
+def optimize_roster_by_slots_v84(pool, platform, sport, style, salary_cap, build_type="Cash", max_lineups=5):
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules["slots"])
+
+    if pool is None or pool.empty:
+        return []
+
+    p = pool.copy()
+    p["Build Score"] = p.apply(lambda r: score_player_for_build(r, build_type), axis=1)
+    p["Value"] = p["Build Score"] / (pd.to_numeric(p["Salary"], errors="coerce").fillna(9999) / 1000)
+    p = p.sort_values(["Value", "Build Score", "DFS Projection"], ascending=False)
+
+    rows = p.to_dict("records")
+    lineups = []
+
+    # Reorder slots to fill restrictive slots first.
+    restrictive_order = sorted(slots, key=lambda s: 99 if s in ["UTIL", "FLEX"] else 1)
+
+    for start_idx in range(min(len(rows), max_lineups * 25)):
+        used = set()
+        salary = 0
+        lineup_rows = []
+
+        ordered_rows = rows[start_idx:] + rows[:start_idx]
+
+        for slot in restrictive_order:
+            best = None
+            best_score = -999999
+
+            for cand in ordered_rows:
+                player = str(cand.get("Player", "")).strip()
+                if not player or player in used:
+                    continue
+
+                cand_salary = int(cand.get("Salary", 0) or 0)
+                if salary + cand_salary > int(salary_cap):
+                    continue
+
+                if not eligible_for_slot_v82(cand.get("Position", "UTIL"), slot, cand.get("Salary Source", "Estimated")):
+                    continue
+
+                # Leave enough minimum salary room for remaining slots.
+                score = float(cand.get("Value", 0) or 0)
+                if score > best_score:
+                    best = cand
+                    best_score = score
+
+            if best is None:
+                break
+
+            best_copy = dict(best)
+            best_copy["Roster Slot"] = slot
+            lineup_rows.append(best_copy)
+            used.add(str(best.get("Player", "")).strip())
+            salary += int(best.get("Salary", 0) or 0)
+
+        if len(lineup_rows) == len(slots):
+            key = tuple(sorted(x["Player"] for x in lineup_rows))
+            if key in [l["Key"] for l in lineups]:
+                continue
+
+            lineups.append({
+                "Key": key,
+                "Build Type": build_type,
+                "Platform": platform,
+                "Sport": sport,
+                "Style": style,
+                "Salary Cap": int(salary_cap),
+                "Salary Used": int(salary),
+                "Salary Left": int(salary_cap) - int(salary),
+                "Players": lineup_rows,
+                "Projected": round(sum(float(x.get("DFS Projection", 0) or 0) for x in lineup_rows), 2),
+                "Ceiling": round(sum(float(x.get("Ceiling", 0) or 0) for x in lineup_rows), 2),
+                "Floor": round(sum(float(x.get("Floor", 0) or 0) for x in lineup_rows), 2),
+                "Avg Confidence": round(sum(float(x.get("DFS Confidence", 50) or 50) for x in lineup_rows) / len(lineup_rows), 1),
+            })
+
+        if len(lineups) >= max_lineups:
+            break
+
+    if not lineups:
+        fallback = fallback_value_lineup(pool, platform, sport, style, salary_cap, build_type=build_type)
+        if fallback:
+            return fallback
+
+    return lineups
+
+
+def render_dfs_pro_lineups(lineups):
+    if not lineups:
+        st.warning("No valid lineup fit yet. Check if the CSV is Classic or Showdown; V91 auto-detects 1-game Showdown files.")
+        return
+
+    for i, lu in enumerate(lineups, start=1):
+        with st.container(border=True):
+            st.markdown(f"### {lu['Build Type']} Lineup #{i}")
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Projected", lu["Projected"])
+            c2.metric("Ceiling", lu["Ceiling"])
+            c3.metric("Salary Used", f"${lu['Salary Used']:,}")
+            c4.metric("Salary Left", f"${lu['Salary Left']:,}")
+            c5.metric("Confidence", f"{lu['Avg Confidence']}%")
+
+            rows = []
+            for p in lu["Players"]:
+                rows.append({
+                    "Slot": p.get("Roster Slot", ""),
+                    "Player": p.get("Player", ""),
+                    "Pos": p.get("Position", ""),
+                    "Salary": p.get("Salary", ""),
+                    "Projection": p.get("DFS Projection", ""),
+                    "Ceiling": p.get("Ceiling", ""),
+                    "Floor": p.get("Floor", ""),
+                    "Leverage": p.get("Leverage", ""),
+                    "Matchup": p.get("Matchup", ""),
+                    "Pick Used": p.get("Pick", ""),
+                    "Salary Source": p.get("Salary Source", ""),
+                })
+
+            safe_dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    render_dk_bulk_upload_tools(lineups, key_prefix=f"dk_bulk_{len(lineups)}")
+
+
+
+# =========================================================
+# DFS MOBILE LOBBY HELPERS
+# =========================================================
+
+def dfs_slate_label_from_time(game_time):
+    txt = str(game_time)
+    if not txt or txt.lower() in ["nan", "none"]:
+        return "Main"
+
+    # Simple slate grouping based on time text.
+    low = txt.lower()
+    if any(x in low for x in ["11:", "12:", "01:", "1:", "02:", "2:", "03:", "3:", "04:", "4:"]):
+        return "Early / Turbo"
+    if any(x in low for x in ["05:", "5:", "06:", "6:", "07:", "7:"]):
+        return "Main"
+    if any(x in low for x in ["08:", "8:", "09:", "9:", "10:", "10:"]):
+        return "Night"
+    return "Main"
+
+
+def build_dfs_slate_cards(df, sport):
+    df = ensure_schema(df)
+    if df.empty:
+        return pd.DataFrame(columns=["Slate", "Games", "Game Times", "Featured"])
+
+    s = df[df["League"] == sport].copy()
+    if s.empty:
+        return pd.DataFrame(columns=["Slate", "Games", "Game Times", "Featured"])
+
+    games = (
+        s.drop_duplicates(subset=["Matchup"])
+        [["Matchup", "Game Time"]]
+        .copy()
+    )
+    games["Slate"] = games["Game Time"].apply(dfs_slate_label_from_time)
+
+    rows = []
+    for slate, g in games.groupby("Slate"):
+        times = sorted(set(str(x) for x in g["Game Time"].dropna().tolist()))
+        rows.append({
+            "Slate": slate,
+            "Games": len(g),
+            "Game Times": " / ".join(times[:3]),
+            "Featured": "Main" in slate or len(g) >= 5,
+        })
+
+    order = {"Early / Turbo": 0, "Main": 1, "Night": 2}
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["Order"] = out["Slate"].map(order).fillna(99)
+    return out.sort_values(["Order", "Games"], ascending=[True, False]).drop(columns=["Order"])
+
+
+def filter_df_for_slate(df, sport, slate):
+    df = ensure_schema(df)
+    s = df[df["League"] == sport].copy()
+
+    if s.empty or not slate:
+        return s
+
+    if slate == "All Games":
+        return s
+
+    return s[s["Game Time"].apply(dfs_slate_label_from_time).eq(slate)].copy()
+
+
+def mobile_style_card(style, rules, selected=False, key_suffix=""):
+    active = "✅ " if selected else ""
+    if st.button(
+        f"{active}{style}\n\n{rules.get('description', '')}",
+        key=f"dfs_mobile_style_{safe_key(style)}_{key_suffix}",
+        use_container_width=True,
+    ):
+        st.session_state["dfs_mobile_style"] = style
+        st.session_state["dfs_mobile_step"] = "slate"
+        st.rerun()
+
+
+def mobile_slate_card(row, selected=False, key_suffix=""):
+    slate = row.get("Slate", "")
+    games = row.get("Games", 0)
+    times = row.get("Game Times", "")
+    featured = "  FEATURED" if row.get("Featured", False) else ""
+    active = "✅ " if selected else ""
+
+    if st.button(
+        f"{active}{slate}{featured}\n\n{games} Games\n{times}",
+        key=f"dfs_mobile_slate_{safe_key(slate)}_{key_suffix}",
+        use_container_width=True,
+    ):
+        st.session_state["dfs_mobile_slate"] = slate
+        st.session_state["dfs_mobile_step"] = "build"
+        st.rerun()
+
+
+def render_mobile_dfs_lobby(df):
+    st.header("DFS Builder")
+
+    # Session defaults
+    if "dfs_mobile_platform" not in st.session_state:
+        st.session_state["dfs_mobile_platform"] = "DraftKings"
+    if "dfs_mobile_sport" not in st.session_state:
+        st.session_state["dfs_mobile_sport"] = "MLB"
+    if "dfs_mobile_step" not in st.session_state:
+        st.session_state["dfs_mobile_step"] = "style"
+
+    top1, top2 = st.columns(2)
+    with top1:
+        platform = st.selectbox(
+            "Platform",
+            ["DraftKings", "FanDuel"],
+            index=["DraftKings", "FanDuel"].index(st.session_state["dfs_mobile_platform"]),
+            key="dfs_mobile_platform_select",
+        )
+    with top2:
+        sport = st.selectbox(
+            "Sport",
+            list(LEAGUES.keys()),
+            index=list(LEAGUES.keys()).index(st.session_state["dfs_mobile_sport"]) if st.session_state["dfs_mobile_sport"] in list(LEAGUES.keys()) else 0,
+            key="dfs_mobile_sport_select",
+        )
+
+    if platform != st.session_state["dfs_mobile_platform"] or sport != st.session_state["dfs_mobile_sport"]:
+        st.session_state["dfs_mobile_platform"] = platform
+        st.session_state["dfs_mobile_sport"] = sport
+        st.session_state["dfs_mobile_step"] = "style"
+        st.session_state.pop("dfs_mobile_style", None)
+        st.session_state.pop("dfs_mobile_slate", None)
+        st.rerun()
+
+    platform = st.session_state["dfs_mobile_platform"]
+    sport = st.session_state["dfs_mobile_sport"]
+
+    st.markdown(f"### {sport}")
+
+    step = st.session_state.get("dfs_mobile_step", "style")
+
+    if step == "style":
+        st.markdown("## Select Game Style")
+
+        styles = dfs_available_styles(platform, sport)
+        for style in styles:
+            rules = dfs_get_rules(platform, sport, style)
+            mobile_style_card(style, rules, selected=style == st.session_state.get("dfs_mobile_style"), key_suffix=f"{platform}_{sport}")
+
+        return
+
+    if step == "slate":
+        back_col, title_col = st.columns([1, 5])
+        with back_col:
+            if st.button("←", key="dfs_mobile_back_to_style", use_container_width=True):
+                st.session_state["dfs_mobile_step"] = "style"
+                st.rerun()
+        with title_col:
+            st.markdown("## Select Slate")
+
+        style = st.session_state.get("dfs_mobile_style", dfs_available_styles(platform, sport)[0])
+        st.caption(dfs_get_rules(platform, sport, style).get("description", ""))
+
+        slates = build_dfs_slate_cards(df, sport)
+        if slates.empty:
+            st.warning("No slates found for this sport yet. Load the sport from Sportsbook or Settings first.")
+            return
+
+        # Include all games option
+        all_row = pd.Series({
+            "Slate": "All Games",
+            "Games": int(slates["Games"].sum()),
+            "Game Times": "Full loaded board",
+            "Featured": True,
+        })
+        mobile_slate_card(all_row, selected=st.session_state.get("dfs_mobile_slate") == "All Games", key_suffix=f"{platform}_{sport}_all")
+
+        for _, row in slates.iterrows():
+            mobile_slate_card(row, selected=row.get("Slate") == st.session_state.get("dfs_mobile_slate"), key_suffix=f"{platform}_{sport}")
+
+        return
+
+    # Build step
+    back_col, title_col = st.columns([1, 5])
+    with back_col:
+        if st.button("←", key="dfs_mobile_back_to_slate", use_container_width=True):
+            st.session_state["dfs_mobile_step"] = "slate"
+            st.rerun()
+    with title_col:
+        st.markdown("## Build Lineups")
+
+    style = st.session_state.get("dfs_mobile_style", dfs_available_styles(platform, sport)[0])
+    slate = st.session_state.get("dfs_mobile_slate", "All Games")
+    rules = dfs_get_rules(platform, sport, style)
+
+    st.markdown(f"### {platform} {sport} {style}")
+    st.caption(f"{slate} • {rules.get('description', '')}")
+    st.write(f"**Roster:** {' · '.join(rules['slots'])}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        salary_cap = st.number_input(
+            "Salary Cap",
+            min_value=10000,
+            max_value=100000,
+            value=int(rules["cap"]),
+            step=500,
+            key=f"dfs_mobile_cap_{platform}_{sport}_{style}_{slate}",
+        )
+    with c2:
+        max_lineups = st.selectbox(
+            "Lineups",
+            [1, 3, 5, 10, 20],
+            index=2,
+            key=f"dfs_mobile_count_{platform}_{sport}_{style}_{slate}",
+        )
+
+    render_csv_only_notice()
+
+    with st.expander("Salary CSV", expanded=True):
+        uploaded_salary = st.file_uploader(
+            "Upload DraftKings/FanDuel salary CSV",
+            type=["csv"],
+            key=f"dfs_csv_only_salary_upload_{platform}_{sport}_{style}_{slate}",
+        )
+        st.caption("This DFS builder now builds directly from the submitted CSV. No DraftKings slate selector is needed.")
+
+    if uploaded_salary is None:
+        st.warning("Upload the DraftKings/FanDuel salary CSV to build lineups.")
+        salary_df = pd.DataFrame()
+        salary_source_label = "No CSV"
+        pool = pd.DataFrame()
+    else:
+        salary_df = read_dfs_salary_file_v87(uploaded_salary, platform)
+        salary_source_label = "Uploaded CSV"
+
+        if salary_df.empty:
+            st.error("CSV uploaded, but the app could not find Name, Position, and Salary columns.")
+            pool = pd.DataFrame()
+        else:
+            st.success(f"Loaded {len(salary_df)} players from uploaded CSV.")
+            detected_style = auto_style_from_csv(platform, sport, style, salary_df)
+            if detected_style != style:
+                st.info(f"Detected 1-game salary CSV. Switched DFS style from {style} to {detected_style}.")
+                style = detected_style
+                rules = dfs_get_rules(platform, sport, style)
+                salary_cap = int(rules.get("cap", salary_cap))
+
+            pool = build_dfs_pool_from_salary_csv(
+                salary_df,
+                betting_df=df,
+                platform=platform,
+                sport=sport,
+                style=style,
+            )
+
+    csv_summary = salary_csv_summary(salary_df)
+
+    c_pool1, c_pool2, c_pool3, c_pool4 = st.columns(4)
+    c_pool1.metric("CSV Players", csv_summary["Rows"])
+    c_pool2.metric("Pool Used", len(pool) if pool is not None else 0)
+    c_pool3.metric("Games", csv_summary["Games"])
+    c_pool4.metric("Slots", len(rules["slots"]))
+
+    st.caption(f"Salary source: {salary_source_label}")
+    if csv_summary["Positions"]:
+        st.caption(f"CSV position coverage: {csv_summary['Positions']}")
+
+    coverage_ok = uploaded_salary is not None and pool is not None and not pool.empty
+
+    build = st.radio(
+        "Build Type",
+        ["Cash", "GPP", "Contrarian"],
+        horizontal=True,
+        key=f"dfs_mobile_build_type_{platform}_{sport}_{style}_{slate}",
+    )
+
+    if not coverage_ok:
+        st.warning("Upload a valid salary CSV first. Lineups are built directly from the CSV player pool.")
+        lineups = []
+    else:
+        lineups = optimize_roster_by_slots_csv_v91(
+            pool,
+            platform,
+            sport,
+            style,
+            salary_cap,
+            build_type=build,
+            max_lineups=max_lineups,
+        )
+
+        render_dfs_pro_lineups(lineups)
+
+    with st.expander("Player Pool"):
+        if pool.empty:
+            st.warning("No DFS player pool available.")
+        else:
+            safe_dataframe(
+                pool.sort_values(["Base Score", "DFS Projection", "Edge %"], ascending=False),
+                cols=[
+                    "Player", "Position", "Salary", "Salary Source", "League", "Matchup",
+                    "Market", "Pick", "DFS Projection", "Ceiling", "Floor", "Leverage",
+                    "DFS Confidence", "Edge %", "Best MN App", "Best Book"
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+
+# =========================================================
+# DFS V82 FIT HELPERS
+# =========================================================
+
+MLB_HITTER_POSITIONS = ["C/1B", "2B", "3B", "SS", "OF", "OF", "OF", "UTIL"]
+
+
+def assign_estimated_positions(pool, sport="MLB"):
+    """
+    When no salary CSV is uploaded, we do not know true DFS positions.
+    This assigns realistic estimated slots so Classic lineups can actually build.
+    Real salary CSV overrides this.
+    """
+    pool = pool.copy()
+
+    if pool.empty:
+        return pool
+
+    if sport != "MLB":
+        return pool
+
+    # Pitchers stay P. Hitters rotate through DK/FanDuel hitter slots.
+    hitter_idx = 0
+    positions = []
+
+    for _, row in pool.iterrows():
+        pos = str(row.get("Position", row.get("Inferred Position", "UTIL"))).upper()
+        market = str(row.get("Market", "")).lower()
+
+        if pos == "P" or "pitching" in market or "strikeout" in market:
+            positions.append("P")
+        else:
+            positions.append(MLB_HITTER_POSITIONS[hitter_idx % len(MLB_HITTER_POSITIONS)])
+            hitter_idx += 1
+
+    pool["Position"] = positions
+    return pool
+
+
+def scale_estimated_salaries_for_cap(pool, platform="DraftKings", sport="MLB", style="Classic"):
+    """
+    Estimated salaries are only a fallback. Scale them so a legal lineup can fit.
+    Real CSV salaries are not touched.
+    """
+    pool = pool.copy()
+
+    if pool.empty:
+        return pool
+
+    rules = dfs_get_rules(platform, sport, style)
+    cap = int(rules.get("cap", 50000))
+    slots = rules.get("slots", [])
+    roster_size = max(1, len(slots))
+    target_avg = cap / roster_size
+
+    salary_source = pool.get("Salary Source", pd.Series(["Estimated"] * len(pool), index=pool.index)).astype(str)
+    estimated_mask = salary_source.str.lower().eq("estimated")
+
+    if not estimated_mask.any():
+        return pool
+
+    # Build affordable salary tiers from projection rank.
+    p = pool.copy()
+    p["Rank Score"] = (
+        pd.to_numeric(p.get("DFS Projection", 0), errors="coerce").fillna(0) * 1.0
+        + pd.to_numeric(p.get("Edge %", 0), errors="coerce").fillna(0) * 0.25
+        + pd.to_numeric(p.get("DFS Confidence", 50), errors="coerce").fillna(50) * 0.05
+    )
+
+    ranks = p.loc[estimated_mask, "Rank Score"].rank(pct=True).fillna(0.5)
+
+    # DK MLB Classic should average below 5k. Use 2800-6800 spread.
+    min_sal = max(2500, int(target_avg * 0.55 // 100 * 100))
+    max_sal = max(min_sal + 1000, int(target_avg * 1.35 // 100 * 100))
+
+    scaled = (min_sal + (max_sal - min_sal) * ranks).round(-2).astype(int)
+    pool.loc[estimated_mask, "Salary"] = scaled
+
+    return pool
+
+
+def eligible_for_slot_v82(position, slot, salary_source="Estimated"):
+    pos = str(position).upper()
+    slot = str(slot).upper()
+    source = str(salary_source).lower()
+
+    # With estimated positions, allow UTIL hitters to fill non-pitcher hitter slots.
+    if source == "estimated":
+        if pos == "UTIL" and slot not in ["P", "QB", "DST", "DEF", "G"]:
+            return True
+
+    return eligible_for_slot(position, slot)
+
+
+def fallback_value_lineup(pool, platform, sport, style, salary_cap, build_type="Cash"):
+    """
+    Backup builder if strict slot matching fails.
+    Still respects cap and roster size. Used only when positions are estimated.
+    """
+    rules = dfs_get_rules(platform, sport, style)
+    roster_size = len(rules["slots"])
+
+    p = pool.copy()
+    if p.empty:
+        return []
+
+    p["Build Score"] = p.apply(lambda r: score_player_for_build(r, build_type), axis=1)
+    p["Value"] = p["Build Score"] / (pd.to_numeric(p["Salary"], errors="coerce").fillna(9999) / 1000)
+    p = p.sort_values(["Value", "Build Score", "DFS Projection"], ascending=False)
+
+    lineup = []
+    used = set()
+    salary = 0
+
+    # Ensure at least required pitcher count for MLB Classic.
+    slots = rules["slots"]
+    required_p = sum(1 for s in slots if s == "P")
+
+    if required_p:
+        pitchers = p[p["Position"].astype(str).str.upper().eq("P")]
+        for _, row in pitchers.iterrows():
+            if len([x for x in lineup if x.get("Roster Slot") == "P"]) >= required_p:
+                break
+            sal = int(row.get("Salary", 0) or 0)
+            player = str(row.get("Player", ""))
+            if player in used or salary + sal > int(salary_cap):
+                continue
+            d = row.to_dict()
+            d["Roster Slot"] = "P"
+            lineup.append(d)
+            used.add(player)
+            salary += sal
+
+    remaining_slots = [s for s in slots if not (s == "P" and len([x for x in lineup if x.get("Roster Slot") == "P"]) > slots[:slots.index(s)+1].count("P"))]
+    # Simpler slot list after already filling pitchers.
+    remaining_slots = slots[len(lineup):]
+
+    for slot in remaining_slots:
+        for _, row in p.iterrows():
+            player = str(row.get("Player", ""))
+            if player in used:
+                continue
+            sal = int(row.get("Salary", 0) or 0)
+            if salary + sal > int(salary_cap):
+                continue
+            if slot == "P" and str(row.get("Position", "")).upper() != "P":
+                continue
+
+            d = row.to_dict()
+            d["Roster Slot"] = slot
+            lineup.append(d)
+            used.add(player)
+            salary += sal
+            break
+
+    if len(lineup) != roster_size:
+        return []
+
+    return [{
+        "Key": tuple(sorted(x["Player"] for x in lineup)),
+        "Build Type": build_type + " Research",
+        "Platform": platform,
+        "Sport": sport,
+        "Style": style,
+        "Salary Cap": int(salary_cap),
+        "Salary Used": int(salary),
+        "Salary Left": int(salary_cap) - int(salary),
+        "Players": lineup,
+        "Projected": round(sum(float(x.get("DFS Projection", 0) or 0) for x in lineup), 2),
+        "Ceiling": round(sum(float(x.get("Ceiling", 0) or 0) for x in lineup), 2),
+        "Floor": round(sum(float(x.get("Floor", 0) or 0) for x in lineup), 2),
+        "Avg Confidence": round(sum(float(x.get("DFS Confidence", 50) or 50) for x in lineup) / len(lineup), 1),
+    }]
+
+
+
+# =========================================================
+# DFS REAL SALARY SOURCE HELPERS V84
+# =========================================================
+
+@st.cache_data(ttl=600, show_spinner=False)
+def read_dfs_salary_url_cached(url, platform="DraftKings"):
+    """
+    Pull exact DFS salaries from a pasted CSV URL.
+    Works with DraftKings/FanDuel salary CSV links when the URL is accessible.
+    """
+    if not url or not str(url).strip():
+        return pd.DataFrame(), "No URL provided."
+
+    try:
+        r = requests.get(str(url).strip(), timeout=(8, 25), headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return pd.DataFrame(), f"URL returned HTTP {r.status_code}."
+
+        text = r.text
+        if not text or "," not in text:
+            return pd.DataFrame(), "URL did not return CSV text."
+
+        from io import StringIO
+        raw = pd.read_csv(StringIO(text))
+
+        # Re-use the same normalizer by writing a temp-like object into dataframe parser logic.
+        salary_df = normalize_dfs_salary_dataframe(raw, platform=platform)
+        if salary_df.empty:
+            return pd.DataFrame(), "CSV loaded but salary columns were not recognized."
+
+        return salary_df, f"Loaded {len(salary_df)} salaries from URL."
+
+    except Exception as e:
+        return pd.DataFrame(), f"Could not load salary URL: {type(e).__name__}: {e}"
+
+
+def normalize_dfs_salary_dataframe(sal, platform="DraftKings"):
+    """
+    Normalizes common DK/FD salary CSV formats.
+    """
+    if sal is None or sal.empty:
+        return pd.DataFrame()
+
+    sal = sal.copy()
+    original_cols = list(sal.columns)
+    lower = {str(c).lower().strip(): c for c in original_cols}
+
+    name_col = None
+    for cand in ["name", "player", "nickname", "player name"]:
+        if cand in lower:
+            name_col = lower[cand]
+            break
+
+    if name_col is None and "first name" in lower and "last name" in lower:
+        sal["Name"] = sal[lower["first name"]].astype(str) + " " + sal[lower["last name"]].astype(str)
+        name_col = "Name"
+
+    salary_col = None
+    for cand in ["salary", "salary ($)", "dk salary", "fd salary"]:
+        if cand in lower:
+            salary_col = lower[cand]
+            break
+
+    pos_col = None
+    for cand in ["roster position", "position", "positions"]:
+        if cand in lower:
+            pos_col = lower[cand]
+            break
+
+    team_col = None
+    for cand in ["teamabbrev", "team", "team abbreviation"]:
+        if cand in lower:
+            team_col = lower[cand]
+            break
+
+    game_col = None
+    for cand in ["game info", "game", "matchup"]:
+        if cand in lower:
+            game_col = lower[cand]
+            break
+
+    if name_col is None or salary_col is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["DFS Name"] = sal[name_col].astype(str)
+    out["Join Name"] = out["DFS Name"].apply(normalize_player_name_for_join)
+    out["DFS Salary"] = pd.to_numeric(sal[salary_col], errors="coerce").fillna(0).astype(int)
+    out["DFS Position"] = sal[pos_col].astype(str) if pos_col else "UTIL"
+    out["DFS Team"] = sal[team_col].astype(str) if team_col else ""
+    out["DFS Game Info"] = sal[game_col].astype(str) if game_col else ""
+    out["Platform"] = platform
+
+    out = out[out["DFS Salary"] > 0].copy()
+    return out.drop_duplicates(subset=["Join Name", "DFS Salary", "DFS Position"], keep="first")
+
+
+def read_dfs_salary_file_v84(uploaded_file, platform="DraftKings"):
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    try:
+        sal = pd.read_csv(uploaded_file)
+    except Exception:
+        return pd.DataFrame()
+
+    return normalize_dfs_salary_dataframe(sal, platform=platform)
+
+
+def combine_salary_sources(uploaded_file=None, salary_url="", platform="DraftKings"):
+    """
+    Priority:
+    1. URL exact salary source
+    2. Uploaded CSV exact salary source
+    3. Empty = estimated
+    """
+    url_df = pd.DataFrame()
+    url_msg = ""
+
+    if salary_url and str(salary_url).strip():
+        url_df, url_msg = read_dfs_salary_url_cached(salary_url, platform)
+
+    if not url_df.empty:
+        url_df["Salary Source Label"] = f"{platform} URL"
+        return url_df, f"{platform} URL", url_msg
+
+    csv_df = read_dfs_salary_file_v84(uploaded_file, platform) if uploaded_file is not None else pd.DataFrame()
+    if not csv_df.empty:
+        csv_df["Salary Source Label"] = "CSV"
+        return csv_df, "CSV", f"Loaded {len(csv_df)} salaries from uploaded CSV."
+
+    return pd.DataFrame(), "Estimated", url_msg if url_msg else "Using estimated salaries."
+
+
+def minimum_salary_used(platform, sport, style, salary_cap, salary_source_label):
+    """
+    With real salary data, force better cap usage.
+    With estimated salaries, keep flexible because salaries are synthetic.
+    """
+    source = str(salary_source_label).lower()
+    if "estimated" in source:
+        return int(float(salary_cap) * 0.58)
+
+    if style and ("showdown" in str(style).lower() or "single" in str(style).lower()):
+        return int(float(salary_cap) * 0.90)
+
+    return int(float(salary_cap) * 0.94)
+
+
+def candidate_lineup_score(lineup_rows, salary_used, salary_cap, build_type, salary_source_label):
+    proj = sum(float(x.get("DFS Projection", 0) or 0) for x in lineup_rows)
+    ceil = sum(float(x.get("Ceiling", 0) or 0) for x in lineup_rows)
+    floor = sum(float(x.get("Floor", 0) or 0) for x in lineup_rows)
+    lev = sum(float(x.get("Leverage", 0) or 0) for x in lineup_rows)
+
+    cap_use = float(salary_used) / max(float(salary_cap), 1)
+    build = str(build_type).lower()
+
+    if "cash" in build:
+        base = proj * 1.15 + floor * 0.65
+    elif "gpp" in build:
+        base = ceil * 1.05 + lev * 0.75 + proj * 0.35
+    elif "contrarian" in build:
+        base = ceil * 0.8 + lev * 1.25 + proj * 0.25
+    else:
+        base = proj
+
+    # Real salaries should use most of cap. Estimated salaries get lighter penalty.
+    source = str(salary_source_label).lower()
+    cap_bonus = cap_use * (25 if "estimated" not in source else 8)
+    return base + cap_bonus
+
+
+def optimize_roster_by_slots_v84(pool, platform, sport, style, salary_cap, build_type="Cash", max_lineups=5, salary_source_label="Estimated"):
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules["slots"])
+
+    if pool is None or pool.empty:
+        return []
+
+    p = pool.copy()
+    p["Build Score"] = p.apply(lambda r: score_player_for_build(r, build_type), axis=1)
+    p["Value"] = p["Build Score"] / (pd.to_numeric(p["Salary"], errors="coerce").fillna(9999) / 1000)
+    p = p.sort_values(["Build Score", "Value", "DFS Projection"], ascending=False)
+
+    rows = p.to_dict("records")
+    lineups = []
+    min_salary = minimum_salary_used(platform, sport, style, salary_cap, salary_source_label)
+
+    restrictive_slots = sorted(slots, key=lambda s: 99 if s in ["UTIL", "FLEX"] else 1)
+
+    # Try a wider set of starts and scoring methods so cap usage improves.
+    for start_idx in range(min(len(rows), max_lineups * 60)):
+        used = set()
+        salary = 0
+        lineup_rows = []
+
+        ordered_rows = rows[start_idx:] + rows[:start_idx]
+
+        for slot in restrictive_slots:
+            best = None
+            best_score = -999999
+
+            for cand in ordered_rows:
+                player = str(cand.get("Player", "")).strip()
+                if not player or player in used:
+                    continue
+
+                cand_salary = int(cand.get("Salary", 0) or 0)
+                if salary + cand_salary > int(salary_cap):
+                    continue
+
+                if not eligible_for_slot_v82(cand.get("Position", "UTIL"), slot, cand.get("Salary Source", salary_source_label)):
+                    continue
+
+                # Prefer better projection but also spend salary responsibly.
+                raw_score = float(cand.get("Build Score", 0) or 0)
+                sal_score = cand_salary / 1000
+                score = raw_score + (sal_score * (0.35 if "estimated" not in str(salary_source_label).lower() else 0.08))
+
+                if score > best_score:
+                    best = cand
+                    best_score = score
+
+            if best is None:
+                break
+
+            best_copy = dict(best)
+            best_copy["Roster Slot"] = slot
+            lineup_rows.append(best_copy)
+            used.add(str(best.get("Player", "")).strip())
+            salary += int(best.get("Salary", 0) or 0)
+
+        if len(lineup_rows) == len(slots):
+            if salary < min_salary:
+                # Keep looking for better cap usage.
+                continue
+
+            key = tuple(sorted(x["Player"] for x in lineup_rows))
+            if key in [l["Key"] for l in lineups]:
+                continue
+
+            lineups.append({
+                "Key": key,
+                "Build Type": build_type,
+                "Platform": platform,
+                "Sport": sport,
+                "Style": style,
+                "Salary Cap": int(salary_cap),
+                "Salary Used": int(salary),
+                "Salary Left": int(salary_cap) - int(salary),
+                "Players": lineup_rows,
+                "Projected": round(sum(float(x.get("DFS Projection", 0) or 0) for x in lineup_rows), 2),
+                "Ceiling": round(sum(float(x.get("Ceiling", 0) or 0) for x in lineup_rows), 2),
+                "Floor": round(sum(float(x.get("Floor", 0) or 0) for x in lineup_rows), 2),
+                "Avg Confidence": round(sum(float(x.get("DFS Confidence", 50) or 50) for x in lineup_rows) / len(lineup_rows), 1),
+                "Lineup Score": round(candidate_lineup_score(lineup_rows, salary, salary_cap, build_type, salary_source_label), 2),
+            })
+
+        if len(lineups) >= max_lineups:
+            break
+
+    if not lineups and "estimated" in str(salary_source_label).lower():
+        fallback = fallback_value_lineup(pool, platform, sport, style, salary_cap, build_type=build_type)
+        if fallback:
+            return fallback
+
+    return sorted(lineups, key=lambda x: (x.get("Lineup Score", 0), x["Projected"], -x["Salary Left"]), reverse=True)[:max_lineups]
+
+
+
+# =========================================================
+# DFS AUTO SALARY LOADER V85
+# =========================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def try_read_salary_csv_url_v87(url, platform="DraftKings"):
+    try:
+        r = requests.get(
+            url,
+            timeout=(6, 20),
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/csv,application/csv,text/plain,*/*",
+            },
+        )
+
+        if r.status_code != 200:
+            return pd.DataFrame(), f"HTTP {r.status_code}"
+
+        text = r.text or ""
+        if "," not in text or len(text) < 200:
+            return pd.DataFrame(), "not a CSV response"
+
+        from io import StringIO
+        raw = pd.read_csv(StringIO(text))
+        normalized = normalize_dfs_salary_dataframe(raw, platform=platform)
+
+        if normalized.empty:
+            return pd.DataFrame(), "CSV did not match known salary format"
+
+        normalized["Auto Source URL"] = url
+        normalized["Salary Source Label"] = f"{platform} Auto"
+        return normalized, f"Loaded {len(normalized)} salaries"
+
+    except Exception as e:
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
+
+
+def dk_sport_code(sport):
+    mapping = {
+        "MLB": "MLB",
+        "NBA": "NBA",
+        "WNBA": "WNBA",
+        "NFL": "NFL",
+        "NHL": "NHL",
+        "UFC/MMA": "MMA",
+        "Soccer": "SOC",
+    }
+    return mapping.get(str(sport), str(sport).upper())
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def discover_draftkings_salary_urls(sport="MLB"):
+    """
+    Experimental DraftKings salary discovery.
+    DraftKings changes public endpoints often, so this returns candidate URLs and
+    tests them. If none work, user can still upload a CSV.
+    """
+    sport_code = dk_sport_code(sport)
+
+    candidates = []
+
+    # Common manually downloadable salary CSV endpoint patterns.
+    # These endpoints may be blocked/changed by DraftKings, but when public they work.
+    base_candidates = [
+        f"https://www.draftkings.com/lineup/getavailableplayerscsv?contestTypeId=0&draftGroupId={{draft_group_id}}",
+        f"https://www.draftkings.com/lineup/getavailableplayerscsv?draftGroupId={{draft_group_id}}",
+    ]
+
+    # Try to discover draft groups from common lobby endpoints.
+    lobby_urls = [
+        "https://api.draftkings.com/contests/v1/contests/lobby",
+        "https://www.draftkings.com/lobby/getcontests?sport=" + sport_code,
+        "https://api.draftkings.com/draftgroups/v1/draftgroups?sport=" + sport_code,
+    ]
+
+    draft_group_ids = []
+
+    for lobby_url in lobby_urls:
+        try:
+            r = requests.get(
+                lobby_url,
+                timeout=(6, 18),
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json,text/plain,*/*",
+                },
+            )
+            if r.status_code != 200:
+                continue
+
+            try:
+                payload = r.json()
+            except Exception:
+                continue
+
+            # Walk nested json looking for draftGroupId-like keys.
+            stack = [payload]
+            while stack:
+                obj = stack.pop()
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        lk = str(k).lower()
+                        if "draftgroupid" in lk or "draft_group_id" in lk:
+                            if str(v).isdigit():
+                                draft_group_ids.append(str(v))
+                        elif isinstance(v, (dict, list)):
+                            stack.append(v)
+                elif isinstance(obj, list):
+                    stack.extend(obj)
+        except Exception:
+            continue
+
+    # Deduplicate and create salary CSV candidates.
+    seen = set()
+    for dg in draft_group_ids:
+        if dg in seen:
+            continue
+        seen.add(dg)
+        for pattern in base_candidates:
+            candidates.append(pattern.format(draft_group_id=dg))
+
+    return candidates[:30]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def auto_load_dfs_salaries_v87(platform="DraftKings", sport="MLB"):
+    """
+    Auto-load salary feed.
+    Currently DraftKings has the best chance through public salary CSV patterns.
+    FanDuel often requires manual salary CSV download, so fallback is expected.
+    """
+    platform = str(platform)
+
+    if platform == "DraftKings":
+        urls = discover_draftkings_salary_urls(sport)
+        errors = []
+
+        for url in urls:
+            df, msg = try_read_salary_csv_url_v87(url, platform=platform)
+            if not df.empty:
+                return df, f"Auto-loaded DraftKings salaries. {msg}"
+            errors.append(f"{url} -> {msg}")
+
+        return pd.DataFrame(), "Auto-loader could not access DraftKings salary CSV for this slate. Upload CSV as backup."
+
+    if platform == "FanDuel":
+        return pd.DataFrame(), "FanDuel automatic salary feed is not public/reliable yet. Upload FanDuel salary CSV as backup."
+
+    return pd.DataFrame(), "Unsupported platform."
+
+
+def combine_salary_sources_v85(uploaded_file=None, salary_url="", platform="DraftKings", sport="MLB", use_auto=False):
+    """
+    Priority:
+    1. Auto loader when requested
+    2. Pasted URL
+    3. Uploaded CSV
+    4. Estimated fallback
+    """
+    if use_auto:
+        auto_df, auto_msg = auto_load_dfs_salaries_v87(platform=platform, sport=sport)
+        if not auto_df.empty:
+            auto_df["Salary Source Label"] = f"{platform} Auto"
+            return auto_df, f"{platform} Auto", auto_msg
+
+    salary_df, label, msg = combine_salary_sources(
+        uploaded_file=uploaded_file,
+        salary_url=salary_url,
+        platform=platform,
+    )
+
+    return salary_df, label, msg
+
+
+
+# =========================================================
+# DFS DK SLATE DISCOVERY V86
+# =========================================================
+
+def flatten_json_items(obj):
+    """Yield dictionaries from nested JSON."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from flatten_json_items(v)
+    elif isinstance(obj, list):
+        for x in obj:
+            yield from flatten_json_items(x)
+
+
+def parse_dk_draft_groups_from_payload(payload, sport="MLB"):
+    rows = []
+    sport_code = dk_sport_code(sport).upper()
+
+    for item in flatten_json_items(payload):
+        if not isinstance(item, dict):
+            continue
+
+        keys = {str(k).lower(): k for k in item.keys()}
+
+        dg_key = None
+        for k in keys:
+            if "draftgroupid" in k or "draft_group_id" in k:
+                dg_key = keys[k]
+                break
+
+        if dg_key is None:
+            continue
+
+        dg = item.get(dg_key)
+        if not str(dg).isdigit():
+            continue
+
+        name = ""
+        for cand in ["name", "contestname", "draftgroupdescription", "description", "displayname", "gameType", "gameTypeName"]:
+            if cand.lower() in keys:
+                name = str(item.get(keys[cand.lower()], "") or "")
+                if name:
+                    break
+
+        start_time = ""
+        for cand in ["starttime", "startDate", "startDateEst", "startDateTime", "startsAt"]:
+            if cand.lower() in keys:
+                start_time = str(item.get(keys[cand.lower()], "") or "")
+                if start_time:
+                    break
+
+        game_count = None
+        for cand in ["gamecount", "gamescount", "numberofgames", "contestgamecount"]:
+            if cand.lower() in keys:
+                try:
+                    game_count = int(float(item.get(keys[cand.lower()], 0) or 0))
+                except Exception:
+                    game_count = None
+                break
+
+        s_val = ""
+        for cand in ["sport", "sportname", "sportCode"]:
+            if cand.lower() in keys:
+                s_val = str(item.get(keys[cand.lower()], "") or "")
+                break
+
+        # Keep if sport info matches or if the endpoint was sport-specific/unknown.
+        joined = " ".join([name, s_val]).upper()
+        if sport_code not in joined and sport.upper() not in joined and s_val:
+            continue
+
+        rows.append({
+            "Draft Group ID": str(dg),
+            "Slate Name": name if name else f"{sport} Draft Group {dg}",
+            "Start Time": start_time,
+            "Games": game_count if game_count is not None else 0,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["Draft Group ID", "Slate Name", "Start Time", "Games"])
+
+    out = pd.DataFrame(rows).drop_duplicates(subset=["Draft Group ID"], keep="first")
+
+    # Fill labels
+    out["Slate Label"] = out.apply(
+        lambda r: f"{r['Slate Name']} • {r['Games']} games • {r['Draft Group ID']}",
+        axis=1,
+    )
+    return out.sort_values(["Games", "Start Time"], ascending=[False, True]).reset_index(drop=True)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def discover_dk_slates_v86(sport="MLB"):
+    sport_code = dk_sport_code(sport)
+
+    urls = [
+        f"https://api.draftkings.com/draftgroups/v1/draftgroups?sport={sport_code}",
+        f"https://www.draftkings.com/lobby/getcontests?sport={sport_code}",
+        "https://api.draftkings.com/contests/v1/contests/lobby",
+    ]
+
+    all_slates = []
+    errors = []
+
+    for url in urls:
+        try:
+            r = requests.get(
+                url,
+                timeout=(6, 20),
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json,text/plain,*/*",
+                },
+            )
+
+            if r.status_code != 200:
+                errors.append(f"{url} HTTP {r.status_code}")
+                continue
+
+            try:
+                payload = r.json()
+            except Exception:
+                errors.append(f"{url} non-json")
+                continue
+
+            parsed = parse_dk_draft_groups_from_payload(payload, sport=sport)
+            if not parsed.empty:
+                parsed["Source"] = url
+                all_slates.append(parsed)
+
+        except Exception as e:
+            errors.append(f"{url} {type(e).__name__}: {e}")
+
+    if all_slates:
+        out = pd.concat(all_slates, ignore_index=True)
+        out = out.drop_duplicates(subset=["Draft Group ID"], keep="first")
+        out = out.sort_values(["Games", "Start Time"], ascending=[False, True]).reset_index(drop=True)
+        out["Slate Label"] = out.apply(
+            lambda r: f"{r['Slate Name']} • {r['Games']} games • ID {r['Draft Group ID']}",
+            axis=1,
+        )
+        return out, "Found DraftKings slates."
+
+    return pd.DataFrame(columns=["Draft Group ID", "Slate Name", "Start Time", "Games", "Slate Label"]), "Could not discover DraftKings slates. DK may be blocking the public endpoint."
+
+
+def dk_salary_url_for_draft_group(draft_group_id):
+    return f"https://www.draftkings.com/lineup/getavailableplayerscsv?draftGroupId={draft_group_id}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_dk_salary_by_draft_group_v87(draft_group_id, sport="MLB"):
+    if not draft_group_id:
+        return pd.DataFrame(), "No draft group selected."
+
+    url = dk_salary_url_for_draft_group(str(draft_group_id))
+    df, msg = try_read_salary_csv_url_v87(url, platform="DraftKings")
+
+    if not df.empty:
+        df["Draft Group ID"] = str(draft_group_id)
+        df["Salary Source Label"] = "DraftKings Slate"
+        return df, f"Loaded {len(df)} exact DK salaries for draft group {draft_group_id}."
+
+    return pd.DataFrame(), f"Could not load DK salary CSV for draft group {draft_group_id}: {msg}"
+
+
+def salary_coverage_report(pool):
+    if pool is None or pool.empty:
+        return {
+            "Pool": 0,
+            "Matched": 0,
+            "Unmatched": 0,
+            "Coverage": 0.0,
+            "Positions": "",
+        }
+
+    p = pool.copy()
+    source = p.get("Salary Source", pd.Series(["Estimated"] * len(p), index=p.index)).astype(str)
+    matched = int((~source.str.lower().eq("estimated")).sum())
+    total = int(len(p))
+    unmatched = total - matched
+    coverage = round((matched / total) * 100, 1) if total else 0.0
+
+    pos_counts = p.get("Position", pd.Series([], dtype=str)).astype(str).value_counts().to_dict()
+    pos_txt = " · ".join([f"{k}: {v}" for k, v in pos_counts.items()])
+
+    return {
+        "Pool": total,
+        "Matched": matched,
+        "Unmatched": unmatched,
+        "Coverage": coverage,
+        "Positions": pos_txt,
+    }
+
+
+def is_salary_coverage_good(report, salary_source_label="Estimated"):
+    if str(salary_source_label).lower() == "estimated":
+        return True
+
+    # V88: allow optimizer once enough exact salaries exist to fill a legal slate,
+    # but still block tiny/partial feeds.
+    if report["Matched"] < 40:
+        return False
+
+    if report["Coverage"] < 25:
+        return False
+
+    return True
+
+
+def combine_salary_sources_v87(uploaded_file=None, salary_url="", platform="DraftKings", sport="MLB", use_auto=False, draft_group_id=None):
+    """
+    Priority:
+    1. Selected DraftKings slate draft group
+    2. Auto loader
+    3. Pasted URL
+    4. Uploaded CSV
+    5. Estimated
+    """
+    if platform == "DraftKings" and draft_group_id:
+        slate_df, slate_msg = load_dk_salary_by_draft_group_v87(draft_group_id, sport=sport)
+        if not slate_df.empty:
+            return slate_df, "DraftKings Slate", slate_msg
+
+    if use_auto:
+        auto_df, auto_msg = auto_load_dfs_salaries_v87(platform=platform, sport=sport)
+        if not auto_df.empty:
+            auto_df["Salary Source Label"] = f"{platform} Auto"
+            return auto_df, f"{platform} Auto", auto_msg
+
+    return combine_salary_sources_v85(
+        uploaded_file=uploaded_file,
+        salary_url=salary_url,
+        platform=platform,
+        sport=sport,
+        use_auto=False,
+    )
+
+
+
+# =========================================================
+# DFS V87 DK SALARY PARSING + FUZZY MATCHING
+# =========================================================
+
+def normalize_dk_position(pos):
+    txt = str(pos or "").upper().strip()
+
+    if not txt or txt in ["NAN", "NONE"]:
+        return "UTIL"
+
+    # DraftKings files can contain UTIL/BN, C/1B, OF, RP/SP, etc.
+    txt = txt.replace("UTIL/BN", "UTIL")
+    txt = txt.replace("BN", "UTIL")
+    txt = txt.replace("SP", "P")
+    txt = txt.replace("RP", "P")
+    txt = txt.replace("IF", "UTIL")
+
+    parts = [p.strip() for p in re.split(r"[/,]", txt) if p.strip()]
+    if not parts:
+        return txt
+
+    # Preserve useful DK combined slots.
+    if "C" in parts and "1B" in parts:
+        return "C/1B"
+
+    # Pick the most DFS-useful position.
+    priority = ["P", "C/1B", "C", "1B", "2B", "3B", "SS", "OF", "PG", "SG", "SF", "PF", "C", "QB", "RB", "WR", "TE", "DST", "D", "G", "F", "M", "W", "UTIL"]
+    for p in priority:
+        if p in parts or p == txt:
+            if p in ["C", "1B"] and ("C" in parts or "1B" in parts):
+                return "C/1B"
+            return p
+
+    return parts[0]
+
+
+def normalize_dfs_salary_dataframe_v87(sal, platform="DraftKings"):
+    """
+    Stronger DK/FD salary parser.
+    Handles:
+    - DraftKings DKSalary CSV
+    - FanDuel salary CSV
+    - Name / Player / Nickname
+    - Roster Position / Position
+    - UTIL/BN -> UTIL
+    """
+    if sal is None or sal.empty:
+        return pd.DataFrame()
+
+    sal = sal.copy()
+    original_cols = list(sal.columns)
+    lower = {str(c).lower().strip(): c for c in original_cols}
+
+    name_col = None
+    for cand in ["name", "player", "nickname", "player name", "display name"]:
+        if cand in lower:
+            name_col = lower[cand]
+            break
+
+    if name_col is None and "first name" in lower and "last name" in lower:
+        sal["Name"] = sal[lower["first name"]].astype(str) + " " + sal[lower["last name"]].astype(str)
+        name_col = "Name"
+
+    salary_col = None
+    for cand in ["salary", "salary ($)", "dk salary", "fd salary"]:
+        if cand in lower:
+            salary_col = lower[cand]
+            break
+
+    pos_col = None
+    # IMPORTANT: DraftKings usually has both Position and Roster Position.
+    # Position is the player eligibility. Roster Position often says UTIL/BN.
+    for cand in ["position", "positions", "player position", "eligible positions", "roster position"]:
+        if cand in lower:
+            pos_col = lower[cand]
+            break
+
+    roster_col = lower.get("roster position")
+
+    team_col = None
+    for cand in ["teamabbrev", "team", "team abbreviation", "teamabbr"]:
+        if cand in lower:
+            team_col = lower[cand]
+            break
+
+    game_col = None
+    for cand in ["game info", "game", "matchup"]:
+        if cand in lower:
+            game_col = lower[cand]
+            break
+
+    if name_col is None or salary_col is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["DFS Name"] = sal[name_col].astype(str)
+    out["Join Name"] = out["DFS Name"].apply(normalize_player_name_for_join)
+    out["DFS Salary"] = pd.to_numeric(sal[salary_col], errors="coerce").fillna(0).astype(int)
+
+    if pos_col:
+        out["DFS Position Raw"] = sal[pos_col].astype(str)
+    elif roster_col:
+        out["DFS Position Raw"] = sal[roster_col].astype(str)
+    else:
+        out["DFS Position Raw"] = "UTIL"
+
+    out["DFS Position"] = out["DFS Position Raw"].apply(normalize_dk_position)
+
+    # If Position was useless but Roster Position exists and is better, keep position raw.
+    if roster_col and pos_col and out["DFS Position"].astype(str).str.upper().eq("UTIL").mean() > 0.75:
+        alt = sal[roster_col].astype(str).apply(normalize_dk_position)
+        # Only use alt if it improves.
+        if alt.astype(str).str.upper().eq("UTIL").mean() < out["DFS Position"].astype(str).str.upper().eq("UTIL").mean():
+            out["DFS Position"] = alt
+
+    out["DFS Team"] = sal[team_col].astype(str) if team_col else ""
+    out["DFS Game Info"] = sal[game_col].astype(str) if game_col else ""
+    out["Platform"] = platform
+
+    out = out[out["DFS Salary"] > 0].copy()
+    return out.drop_duplicates(subset=["Join Name"], keep="first")
+
+
+def read_dfs_salary_file_v87(uploaded_file, platform="DraftKings"):
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    try:
+        sal = pd.read_csv(uploaded_file)
+    except Exception:
+        return pd.DataFrame()
+
+    out = normalize_dfs_salary_dataframe_v87(sal, platform=platform)
+    if not out.empty:
+        out["Salary Source Label"] = "Uploaded CSV"
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def read_dfs_salary_url_cached_v87(url, platform="DraftKings"):
+    if not url or not str(url).strip():
+        return pd.DataFrame(), "No URL provided."
+
+    try:
+        r = requests.get(str(url).strip(), timeout=(8, 25), headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return pd.DataFrame(), f"URL returned HTTP {r.status_code}."
+
+        text = r.text
+        if not text or "," not in text:
+            return pd.DataFrame(), "URL did not return CSV text."
+
+        from io import StringIO
+        raw = pd.read_csv(StringIO(text))
+        salary_df = normalize_dfs_salary_dataframe_v87(raw, platform=platform)
+
+        if salary_df.empty:
+            return pd.DataFrame(), "CSV loaded but salary columns were not recognized."
+
+        salary_df["Salary Source Label"] = f"{platform} URL"
+        return salary_df, f"Loaded {len(salary_df)} salaries from URL."
+
+    except Exception as e:
+        return pd.DataFrame(), f"Could not load salary URL: {type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def try_read_salary_csv_url_v87(url, platform="DraftKings"):
+    try:
+        r = requests.get(
+            url,
+            timeout=(6, 20),
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/csv,application/csv,text/plain,*/*",
+            },
+        )
+
+        if r.status_code != 200:
+            return pd.DataFrame(), f"HTTP {r.status_code}"
+
+        text = r.text or ""
+        if "," not in text or len(text) < 200:
+            return pd.DataFrame(), "not a CSV response"
+
+        from io import StringIO
+        raw = pd.read_csv(StringIO(text))
+        normalized = normalize_dfs_salary_dataframe_v87(raw, platform=platform)
+
+        if normalized.empty:
+            return pd.DataFrame(), "CSV did not match known salary format"
+
+        normalized["Auto Source URL"] = url
+        normalized["Salary Source Label"] = f"{platform} Auto"
+        return normalized, f"Loaded {len(normalized)} salaries"
+
+    except Exception as e:
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
+
+
+def fuzzy_score_name(a, b):
+    """
+    Lightweight fuzzy score without extra dependencies.
+    Good enough for J.J. vs JJ, accents, suffixes, initials.
+    """
+    import difflib
+
+    aa = normalize_player_name_for_join(a)
+    bb = normalize_player_name_for_join(b)
+
+    if not aa or not bb:
+        return 0
+
+    if aa == bb:
+        return 100
+
+    if aa in bb or bb in aa:
+        return 92
+
+    return int(difflib.SequenceMatcher(None, aa, bb).ratio() * 100)
+
+
+def attach_salary_to_pool_v87(pool, salary_df, platform="DraftKings"):
+    """
+    Exact join first, then fuzzy join for unmatched players.
+    """
+    pool = pool.copy()
+
+    if salary_df is None or salary_df.empty:
+        return pool
+
+    sal = salary_df.copy()
+    sal["Join Name"] = sal["DFS Name"].apply(normalize_player_name_for_join)
+
+    pool["Join Name"] = pool["Player"].apply(normalize_player_name_for_join)
+
+    merged = pool.merge(
+        sal[["Join Name", "DFS Name", "DFS Salary", "DFS Position", "DFS Team", "DFS Game Info", "Salary Source Label"]],
+        how="left",
+        on="Join Name",
+    )
+
+    unmatched = merged["DFS Salary"].isna()
+    if unmatched.any():
+        sal_records = sal.to_dict("records")
+
+        for idx in merged[unmatched].index:
+            player = merged.at[idx, "Player"]
+            best = None
+            best_score = 0
+
+            for srow in sal_records:
+                score = fuzzy_score_name(player, srow.get("DFS Name", ""))
+                if score > best_score:
+                    best_score = score
+                    best = srow
+
+            if best is not None and best_score >= 88:
+                merged.at[idx, "DFS Name"] = best.get("DFS Name", "")
+                merged.at[idx, "DFS Salary"] = best.get("DFS Salary", None)
+                merged.at[idx, "DFS Position"] = best.get("DFS Position", "")
+                merged.at[idx, "DFS Team"] = best.get("DFS Team", "")
+                merged.at[idx, "DFS Game Info"] = best.get("DFS Game Info", "")
+                merged.at[idx, "Salary Source Label"] = best.get("Salary Source Label", "Fuzzy Salary Match")
+                merged.at[idx, "Salary Match Score"] = best_score
+            else:
+                merged.at[idx, "Salary Match Score"] = best_score
+
+    merged["Salary"] = pd.to_numeric(merged["DFS Salary"], errors="coerce")
+    merged["Position"] = merged["DFS Position"].fillna(merged.get("Inferred Position", "UTIL")).apply(normalize_dk_position)
+    merged["Salary Source"] = merged.apply(
+        lambda r: r.get("Salary Source Label", "Salary CSV") if pd.notna(r.get("Salary")) and float(r.get("Salary", 0) or 0) > 0 else "Estimated",
+        axis=1,
+    )
+
+    return merged
+
+
+def combine_salary_sources_v87(uploaded_file=None, salary_url="", platform="DraftKings", sport="MLB", use_auto=False, draft_group_id=None):
+    """
+    Priority changed:
+    1. Uploaded CSV, because user likely uploaded exact slate salary file.
+    2. Pasted URL
+    3. Selected DK slate auto
+    4. Auto loader fallback
+    5. Estimated
+    """
+    csv_df = read_dfs_salary_file_v87(uploaded_file, platform) if uploaded_file is not None else pd.DataFrame()
+    if not csv_df.empty:
+        return csv_df, "Uploaded CSV", f"Loaded {len(csv_df)} salaries from uploaded CSV."
+
+    if salary_url and str(salary_url).strip():
+        url_df, url_msg = read_dfs_salary_url_cached_v87(salary_url, platform)
+        if not url_df.empty:
+            return url_df, f"{platform} URL", url_msg
+
+    if platform == "DraftKings" and draft_group_id:
+        slate_df, slate_msg = load_dk_salary_by_draft_group_v87(draft_group_id, sport=sport)
+        if not slate_df.empty:
+            return slate_df, "DraftKings Slate", slate_msg
+
+    if use_auto:
+        auto_df, auto_msg = auto_load_dfs_salaries_v87(platform=platform, sport=sport)
+        if not auto_df.empty:
+            return auto_df, f"{platform} Auto", auto_msg
+
+    return pd.DataFrame(), "Estimated", "Using estimated salaries."
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_dk_salary_by_draft_group_v87(draft_group_id, sport="MLB"):
+    if not draft_group_id:
+        return pd.DataFrame(), "No draft group selected."
+
+    url = dk_salary_url_for_draft_group(str(draft_group_id))
+    df, msg = try_read_salary_csv_url_v87(url, platform="DraftKings")
+
+    if not df.empty:
+        df["Draft Group ID"] = str(draft_group_id)
+        df["Salary Source Label"] = "DraftKings Slate"
+        return df, f"Loaded {len(df)} exact DK salaries for draft group {draft_group_id}."
+
+    return pd.DataFrame(), f"Could not load DK salary CSV for draft group {draft_group_id}: {msg}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def auto_load_dfs_salaries_v87(platform="DraftKings", sport="MLB"):
+    if platform == "DraftKings":
+        slates, msg = discover_dk_slates_v86(sport)
+        if not slates.empty:
+            # Try biggest slates first.
+            for _, row in slates.sort_values("Games", ascending=False).iterrows():
+                dg = row.get("Draft Group ID")
+                df, load_msg = load_dk_salary_by_draft_group_v87(dg, sport)
+                if not df.empty and len(df) >= 100:
+                    return df, f"Auto-loaded DraftKings slate {dg}. {load_msg}"
+
+            # Return largest available even if small, but message will show low coverage later.
+            first = slates.sort_values("Games", ascending=False).iloc[0]
+            df, load_msg = load_dk_salary_by_draft_group_v87(first.get("Draft Group ID"), sport)
+            if not df.empty:
+                return df, f"Auto-loaded partial DraftKings salaries. {load_msg}"
+
+        return pd.DataFrame(), "Auto-loader could not access a full DraftKings salary slate. Upload CSV as backup."
+
+    if platform == "FanDuel":
+        return pd.DataFrame(), "FanDuel automatic salary feed is not public/reliable yet. Upload FanDuel salary CSV as backup."
+
+    return pd.DataFrame(), "Unsupported platform."
+
+
+
+# =========================================================
+# DFS V88 PLAYER NAME CLEANING + MATCH DEBUG
+# =========================================================
+
+def clean_prop_player_name(name):
+    """
+    Converts betting prop text into a clean DFS player name.
+
+    Examples:
+    - "Nick Gonzales Over +0.5 Hits (+120)" -> "Nick Gonzales"
+    - "Mookie Betts Under 1.5 Total Bases" -> "Mookie Betts"
+    - "J.J. Bleday - Hits" -> "J.J. Bleday"
+    """
+    txt = str(name or "").strip()
+
+    if not txt:
+        return ""
+
+    # Remove odds.
+    txt = re.sub(r"\([+-]?\d+\)", "", txt).strip()
+
+    # Remove common prop side/text suffixes.
+    txt = re.split(
+        r"\s+(Over|Under|Yes|No)\s+[-+]?\d*\.?\d*",
+        txt,
+        flags=re.I,
+    )[0].strip()
+
+    txt = re.split(
+        r"\s+(Over|Under|Yes|No)\s+",
+        txt,
+        flags=re.I,
+    )[0].strip()
+
+    # Remove dash suffixes that contain market names.
+    txt = re.split(
+        r"\s+-\s+(Hits|Total Bases|Runs|RBI|Walks|Strikeouts|Singles|Doubles|Home Runs|Bases|Assists|Points|Rebounds)",
+        txt,
+        flags=re.I,
+    )[0].strip()
+
+    # Remove market words if they are still attached.
+    txt = re.sub(
+        r"\b(Hits|Total Bases|Runs|RBI|Walks|Strikeouts|Singles|Doubles|Triples|Home Runs|Pitching|Earned Runs|Outs Recorded)\b.*$",
+        "",
+        txt,
+        flags=re.I,
+    ).strip()
+
+    # Remove team separators if accidentally present.
+    txt = re.split(r"\s+@\s+|\s+vs\.?\s+", txt, flags=re.I)[0].strip()
+
+    # Clean whitespace.
+    txt = re.sub(r"\s+", " ", txt).strip()
+
+    return txt
+
+
+def player_match_keys(name):
+    """
+    Multiple normalized keys for better DFS salary matching.
+    """
+    clean = clean_prop_player_name(name)
+    raw = str(name or "").strip()
+
+    keys = set()
+    for n in [clean, raw]:
+        if not n:
+            continue
+
+        base = normalize_player_name_for_join(n)
+        if base:
+            keys.add(base)
+
+        # Remove common suffixes.
+        no_suffix = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b$", "", n, flags=re.I).strip()
+        ns = normalize_player_name_for_join(no_suffix)
+        if ns:
+            keys.add(ns)
+
+        # Remove periods for initials.
+        no_periods = n.replace(".", "")
+        np = normalize_player_name_for_join(no_periods)
+        if np:
+            keys.add(np)
+
+        # First initial + last name fallback.
+        parts = re.findall(r"[A-Za-zÀ-ÿ']+", n)
+        if len(parts) >= 2:
+            fi_last = parts[0][0] + parts[-1]
+            keys.add(normalize_player_name_for_join(fi_last))
+
+    return [k for k in keys if k]
+
+
+def salary_match_score(pool_name, dfs_name):
+    """
+    Stronger score for DFS salary matching.
+    """
+    import difflib
+
+    pool_clean = clean_prop_player_name(pool_name)
+    dfs_clean = clean_prop_player_name(dfs_name)
+
+    p_keys = player_match_keys(pool_clean)
+    d_keys = player_match_keys(dfs_clean)
+
+    if not p_keys or not d_keys:
+        return 0
+
+    if set(p_keys) & set(d_keys):
+        return 100
+
+    best = 0
+    for pk in p_keys:
+        for dk in d_keys:
+            if pk == dk:
+                return 100
+            if pk in dk or dk in pk:
+                best = max(best, 94)
+            best = max(best, int(difflib.SequenceMatcher(None, pk, dk).ratio() * 100))
+
+    return best
+
+
+def attach_salary_to_pool_v88(pool, salary_df, platform="DraftKings"):
+    """
+    V88 salary attach:
+    - Clean prop-player names first
+    - Exact multi-key match
+    - Fuzzy fallback
+    """
+    pool = pool.copy()
+
+    if salary_df is None or salary_df.empty:
+        return pool
+
+    sal = salary_df.copy()
+
+    if "DFS Name" not in sal.columns:
+        return pool
+
+    sal["DFS Clean Name"] = sal["DFS Name"].apply(clean_prop_player_name)
+    sal["Salary Keys"] = sal["DFS Clean Name"].apply(player_match_keys)
+
+    # Build lookup map from every possible salary key.
+    salary_lookup = {}
+    for _, srow in sal.iterrows():
+        for key in srow.get("Salary Keys", []):
+            if key and key not in salary_lookup:
+                salary_lookup[key] = srow.to_dict()
+
+    pool["DFS Match Name"] = pool["Player"].apply(clean_prop_player_name)
+    pool["Salary Match Score"] = 0
+    pool["Matched DFS Name"] = ""
+
+    salaries = []
+    positions = []
+    teams = []
+    games = []
+    sources = []
+    matched_names = []
+    scores = []
+
+    sal_records = sal.to_dict("records")
+
+    for _, prow in pool.iterrows():
+        pname = prow.get("DFS Match Name", prow.get("Player", ""))
+        keys = player_match_keys(pname)
+
+        match = None
+        score = 0
+
+        # Exact multi-key match first.
+        for key in keys:
+            if key in salary_lookup:
+                match = salary_lookup[key]
+                score = 100
+                break
+
+        # Fuzzy fallback.
+        if match is None:
+            best_score = 0
+            best_match = None
+            for srow in sal_records:
+                s = salary_match_score(pname, srow.get("DFS Name", ""))
+                if s > best_score:
+                    best_score = s
+                    best_match = srow
+
+            if best_match is not None and best_score >= 86:
+                match = best_match
+                score = best_score
+
+        if match is not None:
+            salaries.append(match.get("DFS Salary", None))
+            positions.append(normalize_dk_position(match.get("DFS Position", "")))
+            teams.append(match.get("DFS Team", ""))
+            games.append(match.get("DFS Game Info", ""))
+            sources.append(match.get("Salary Source Label", "Salary CSV"))
+            matched_names.append(match.get("DFS Name", ""))
+            scores.append(score)
+        else:
+            salaries.append(None)
+            positions.append(prow.get("Inferred Position", "UTIL"))
+            teams.append("")
+            games.append("")
+            sources.append("Estimated")
+            matched_names.append("")
+            scores.append(score)
+
+    pool["DFS Salary"] = salaries
+    pool["DFS Position"] = positions
+    pool["DFS Team"] = teams
+    pool["DFS Game Info"] = games
+    pool["Matched DFS Name"] = matched_names
+    pool["Salary Match Score"] = scores
+
+    pool["Salary"] = pd.to_numeric(pool["DFS Salary"], errors="coerce")
+    pool["Position"] = pool["DFS Position"].fillna(pool.get("Inferred Position", "UTIL")).apply(normalize_dk_position)
+    pool["Salary Source"] = [
+        src if pd.notna(salv) and float(salv or 0) > 0 else "Estimated"
+        for src, salv in zip(sources, salaries)
+    ]
+
+    return pool
+
+
+def salary_match_debug_table(pool, salary_df, max_rows=25):
+    """
+    Build debug tables for Streamlit display.
+    """
+    debug = {}
+
+    if salary_df is None or salary_df.empty:
+        debug["salary_sample"] = pd.DataFrame()
+    else:
+        s = salary_df.copy()
+        for col in ["DFS Name", "Join Name", "DFS Position", "DFS Salary", "DFS Team", "DFS Game Info"]:
+            if col not in s.columns:
+                s[col] = ""
+        s["Clean Name"] = s["DFS Name"].apply(clean_prop_player_name)
+        s["Match Keys"] = s["Clean Name"].apply(lambda x: ", ".join(player_match_keys(x)[:3]))
+        debug["salary_sample"] = s[["DFS Name", "Clean Name", "Match Keys", "DFS Position", "DFS Salary", "DFS Team", "DFS Game Info"]].head(max_rows)
+
+    if pool is None or pool.empty:
+        debug["pool_sample"] = pd.DataFrame()
+        debug["unmatched"] = pd.DataFrame()
+        debug["best_guesses"] = pd.DataFrame()
+        return debug
+
+    p = pool.copy()
+    for col in ["Player", "DFS Match Name", "Matched DFS Name", "Salary", "Position", "Salary Source", "Salary Match Score"]:
+        if col not in p.columns:
+            p[col] = ""
+
+    p["Clean Player"] = p["Player"].apply(clean_prop_player_name)
+    p["Match Keys"] = p["Clean Player"].apply(lambda x: ", ".join(player_match_keys(x)[:3]))
+    debug["pool_sample"] = p[["Player", "Clean Player", "Match Keys", "Matched DFS Name", "Salary", "Position", "Salary Source", "Salary Match Score"]].head(max_rows)
+
+    unmatched = p[p["Salary Source"].astype(str).str.lower().eq("estimated")].copy()
+    debug["unmatched"] = unmatched[["Player", "Clean Player", "Match Keys", "Position", "Salary Match Score"]].head(max_rows)
+
+    guesses = []
+    if salary_df is not None and not salary_df.empty and not unmatched.empty:
+        sal_records = salary_df.to_dict("records")
+        for _, row in unmatched.head(15).iterrows():
+            best_name = ""
+            best_score = 0
+            for srow in sal_records:
+                sc = salary_match_score(row.get("Clean Player", row.get("Player", "")), srow.get("DFS Name", ""))
+                if sc > best_score:
+                    best_score = sc
+                    best_name = srow.get("DFS Name", "")
+            guesses.append({
+                "Pool Player": row.get("Player", ""),
+                "Clean Player": row.get("Clean Player", ""),
+                "Best DK Guess": best_name,
+                "Score": best_score,
+            })
+
+    debug["best_guesses"] = pd.DataFrame(guesses)
+    return debug
+
+
+def render_salary_match_debug(pool, salary_df):
+    with st.expander("Salary Match Debug"):
+        dbg = salary_match_debug_table(pool, salary_df)
+
+        st.markdown("##### DK/FanDuel Salary CSV sample")
+        if dbg["salary_sample"].empty:
+            st.info("No salary rows loaded.")
+        else:
+            st.dataframe(dbg["salary_sample"], use_container_width=True, hide_index=True)
+
+        st.markdown("##### Betting player pool sample")
+        if dbg["pool_sample"].empty:
+            st.info("No player pool rows.")
+        else:
+            st.dataframe(dbg["pool_sample"], use_container_width=True, hide_index=True)
+
+        st.markdown("##### Unmatched examples")
+        if dbg["unmatched"].empty:
+            st.success("No unmatched examples in sample.")
+        else:
+            st.dataframe(dbg["unmatched"], use_container_width=True, hide_index=True)
+
+        st.markdown("##### Best fuzzy guesses")
+        if dbg["best_guesses"].empty:
+            st.info("No fuzzy guesses to show.")
+        else:
+            st.dataframe(dbg["best_guesses"], use_container_width=True, hide_index=True)
+
+
+
+# =========================================================
+# DFS V89 SLATE FILTER HELPERS
+# =========================================================
+
+DK_TEAM_ALIASES = {
+    "ARI": ["Arizona Diamondbacks", "Diamondbacks"],
+    "ATL": ["Atlanta Braves", "Braves"],
+    "BAL": ["Baltimore Orioles", "Orioles"],
+    "BOS": ["Boston Red Sox", "Red Sox"],
+    "CHC": ["Chicago Cubs", "Cubs"],
+    "CWS": ["Chicago White Sox", "White Sox"],
+    "CHW": ["Chicago White Sox", "White Sox"],
+    "CIN": ["Cincinnati Reds", "Reds"],
+    "CLE": ["Cleveland Guardians", "Guardians"],
+    "COL": ["Colorado Rockies", "Rockies"],
+    "DET": ["Detroit Tigers", "Tigers"],
+    "HOU": ["Houston Astros", "Astros"],
+    "KC": ["Kansas City Royals", "Royals"],
+    "KCR": ["Kansas City Royals", "Royals"],
+    "LAA": ["Los Angeles Angels", "Angels"],
+    "LAD": ["Los Angeles Dodgers", "Dodgers"],
+    "MIA": ["Miami Marlins", "Marlins"],
+    "MIL": ["Milwaukee Brewers", "Brewers"],
+    "MIN": ["Minnesota Twins", "Twins"],
+    "NYM": ["New York Mets", "Mets"],
+    "NYY": ["New York Yankees", "Yankees"],
+    "ATH": ["Athletics"],
+    "OAK": ["Athletics", "Oakland Athletics"],
+    "PHI": ["Philadelphia Phillies", "Phillies"],
+    "PIT": ["Pittsburgh Pirates", "Pirates"],
+    "SD": ["San Diego Padres", "Padres"],
+    "SDP": ["San Diego Padres", "Padres"],
+    "SEA": ["Seattle Mariners", "Mariners"],
+    "SF": ["San Francisco Giants", "Giants"],
+    "SFG": ["San Francisco Giants", "Giants"],
+    "STL": ["St. Louis Cardinals", "Saint Louis Cardinals", "Cardinals"],
+    "TB": ["Tampa Bay Rays", "Rays"],
+    "TBR": ["Tampa Bay Rays", "Rays"],
+    "TEX": ["Texas Rangers", "Rangers"],
+    "TOR": ["Toronto Blue Jays", "Blue Jays"],
+    "WSH": ["Washington Nationals", "Nationals"],
+    "WAS": ["Washington Nationals", "Nationals"],
+}
+
+
+def extract_dk_game_codes(game_info):
+    """
+    DraftKings Game Info often looks like:
+    "NYY@TOR 06/14/2026 01:10PM ET"
+    Returns ["NYY", "TOR"].
+    """
+    txt = str(game_info or "").upper()
+    m = re.search(r"\b([A-Z]{2,3})@([A-Z]{2,3})\b", txt)
+    if not m:
+        return []
+
+    return [m.group(1), m.group(2)]
+
+
+def dk_codes_to_team_terms(codes):
+    terms = []
+    for code in codes:
+        code = str(code).upper().strip()
+        terms.extend(DK_TEAM_ALIASES.get(code, [code]))
+    return sorted(set([t for t in terms if t]))
+
+
+def salary_df_slate_terms(salary_df):
+    """
+    Build a list of team-name terms that represent the exact DK salary slate.
+    """
+    if salary_df is None or salary_df.empty or "DFS Game Info" not in salary_df.columns:
+        return []
+
+    codes = []
+    for g in salary_df["DFS Game Info"].dropna().astype(str).unique():
+        codes.extend(extract_dk_game_codes(g))
+
+    return dk_codes_to_team_terms(codes)
+
+
+def salary_df_slate_games(salary_df):
+    if salary_df is None or salary_df.empty or "DFS Game Info" not in salary_df.columns:
+        return pd.DataFrame()
+
+    rows = []
+    seen = set()
+
+    for g in salary_df["DFS Game Info"].dropna().astype(str).unique():
+        codes = extract_dk_game_codes(g)
+        if len(codes) != 2:
+            continue
+
+        terms = dk_codes_to_team_terms(codes)
+        key = tuple(codes)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append({
+            "DK Game Info": g,
+            "Away Code": codes[0],
+            "Home Code": codes[1],
+            "Matched Team Terms": " / ".join(terms),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def matchup_matches_slate_terms(matchup, terms):
+    txt = str(matchup or "").lower()
+    if not txt or not terms:
+        return True
+
+    return any(str(term).lower() in txt for term in terms)
+
+
+def filter_betting_pool_to_salary_slate(df, salary_df, sport="MLB"):
+    """
+    If exact salary slate has game info, restrict betting board to those games.
+    This prevents a Turbo/Main slate salary file from trying to match all MLB props.
+    """
+    board = ensure_schema(df)
+    if board.empty:
+        return board, {
+            "Applied": False,
+            "Terms": [],
+            "Before": 0,
+            "After": 0,
+            "Reason": "empty board",
+        }
+
+    terms = salary_df_slate_terms(salary_df)
+    before = len(board)
+
+    if not terms:
+        return board, {
+            "Applied": False,
+            "Terms": [],
+            "Before": before,
+            "After": before,
+            "Reason": "no DK Game Info/team terms found",
+        }
+
+    if "Matchup" not in board.columns:
+        return board, {
+            "Applied": False,
+            "Terms": terms,
+            "Before": before,
+            "After": before,
+            "Reason": "no Matchup column",
+        }
+
+    filtered = board[board["Matchup"].apply(lambda m: matchup_matches_slate_terms(m, terms))].copy()
+
+    # If the filter is too aggressive, return original so app remains usable.
+    if filtered.empty:
+        return board, {
+            "Applied": False,
+            "Terms": terms,
+            "Before": before,
+            "After": before,
+            "Reason": "filter produced zero rows",
+        }
+
+    return filtered, {
+        "Applied": True,
+        "Terms": terms,
+        "Before": before,
+        "After": len(filtered),
+        "Reason": "filtered by DK salary CSV Game Info",
+    }
+
+
+def render_slate_filter_report(salary_df, slate_filter_report):
+    with st.expander("Slate Match Info"):
+        st.write(
+            f"Slate filter: {'ON' if slate_filter_report.get('Applied') else 'OFF'} "
+            f"({slate_filter_report.get('Before')} → {slate_filter_report.get('After')} rows)"
+        )
+        st.caption(slate_filter_report.get("Reason", ""))
+
+        terms = slate_filter_report.get("Terms", [])
+        if terms:
+            st.write("Detected slate teams:")
+            st.write(", ".join(terms[:40]))
+
+        games = salary_df_slate_games(salary_df)
+        if games.empty:
+            st.info("No DK Game Info found in salary CSV.")
+        else:
+            st.dataframe(games, use_container_width=True, hide_index=True)
+
+
+
+# =========================================================
+# DFS V90 CSV-ONLY LINEUP BUILDER
+# =========================================================
+
+def projection_from_salary_and_position(row, sport="MLB"):
+    salary = float(row.get("DFS Salary", row.get("Salary", 0)) or 0)
+    pos = str(row.get("DFS Position", row.get("Position", "UTIL"))).upper()
+
+    if salary <= 0:
+        salary = 3000
+
+    if sport == "MLB":
+        if pos == "P":
+            base = 7.0 + (salary / 1000) * 1.15
+        else:
+            base = 4.0 + (salary / 1000) * 0.75
+    elif sport in ["NBA", "WNBA"]:
+        base = 8.0 + (salary / 1000) * 2.6
+    elif sport == "NFL":
+        base = 5.0 + (salary / 1000) * 1.8
+    elif sport == "NHL":
+        base = 3.0 + (salary / 1000) * 0.9
+    else:
+        base = 5.0 + (salary / 1000) * 1.0
+
+    return round(base, 2)
+
+
+def build_dfs_pool_from_salary_csv(salary_df, betting_df=None, platform="DraftKings", sport="MLB", style="Classic"):
+    """
+    CSV-first DFS pool.
+    Every CSV row becomes a DFS player. Betting/AI props only enrich if names match.
+    """
+    if salary_df is None or salary_df.empty:
+        return pd.DataFrame()
+
+    sal = salary_df.copy()
+
+    if "DFS Name" not in sal.columns or "DFS Salary" not in sal.columns:
+        sal = normalize_dfs_salary_dataframe_v87(sal, platform=platform)
+
+    if sal.empty:
+        return pd.DataFrame()
+
+    for col in ["DFS Name", "DFS Salary", "DFS Position", "DFS Team", "DFS Game Info"]:
+        if col not in sal.columns:
+            sal[col] = ""
+
+    pool = pd.DataFrame()
+    pool["Player"] = sal["DFS Name"].astype(str)
+    pool["DFS Match Name"] = pool["Player"].apply(clean_prop_player_name)
+    pool["Position"] = sal["DFS Position"].apply(normalize_dk_position)
+    pool["Salary"] = pd.to_numeric(sal["DFS Salary"], errors="coerce").fillna(0).astype(int)
+    pool["Salary Source"] = "Uploaded CSV"
+    pool["League"] = sport
+    pool["Matchup"] = sal["DFS Game Info"].astype(str)
+    pool["Team"] = sal["DFS Team"].astype(str)
+    pool["Market"] = "DFS Salary CSV"
+    pool["Pick"] = pool["Player"]
+    pool["Best Book"] = platform
+    pool["Best MN App"] = platform
+    pool["Best Odds"] = 0
+    pool["Line"] = ""
+    pool["Is Prop"] = True
+    pool["Salary Match Score"] = 100
+    pool["Matched DFS Name"] = pool["Player"]
+
+    pool["DFS Projection"] = pool.apply(lambda r: projection_from_salary_and_position(r, sport), axis=1)
+    pool["Floor"] = (pd.to_numeric(pool["DFS Projection"], errors="coerce").fillna(0) * 0.55).round(2)
+    pool["Ceiling"] = (pd.to_numeric(pool["DFS Projection"], errors="coerce").fillna(0) * 1.55).round(2)
+    pool["Leverage"] = (10000 / pool["Salary"].replace(0, 3000)).clip(0, 8).round(2)
+    pool["DFS Confidence"] = 62.0
+    pool["Edge %"] = 0.0
+    pool["Model Probability %"] = 50.0
+    pool["AI Confidence"] = 62.0
+    pool["Priority Score"] = pool["DFS Projection"]
+
+    board = ensure_schema(betting_df) if betting_df is not None else pd.DataFrame()
+    if not board.empty:
+        try:
+            board = board[board["League"] == sport].copy()
+            if "AI Confidence" not in board.columns:
+                board = add_ai_columns(board)
+
+            board["Clean Player"] = board["Player"].apply(clean_prop_player_name)
+            board["Join Key"] = board["Clean Player"].apply(normalize_player_name_for_join)
+            board["DFS Projection Num"] = pd.to_numeric(board.get("DFS Projection", 0), errors="coerce").fillna(0)
+            board["AI Confidence Num"] = pd.to_numeric(board.get("AI Confidence", 0), errors="coerce").fillna(0)
+            board["Edge Num"] = pd.to_numeric(board.get("Edge %", 0), errors="coerce").fillna(0)
+
+            best = (
+                board.sort_values(["AI Confidence Num", "Edge Num", "DFS Projection Num"], ascending=False)
+                .drop_duplicates(subset=["Join Key"], keep="first")
+            )
+
+            enrich = {}
+            for _, r in best.iterrows():
+                key = normalize_player_name_for_join(r.get("Clean Player", ""))
+                if key:
+                    enrich[key] = r.to_dict()
+
+            for idx, row in pool.iterrows():
+                pkey = normalize_player_name_for_join(row.get("Player", ""))
+                hit = enrich.get(pkey)
+
+                if hit is None:
+                    best_hit = None
+                    best_score = 0
+                    for _, v in best.iterrows():
+                        sc = salary_match_score(row.get("Player", ""), v.get("Clean Player", ""))
+                        if sc > best_score:
+                            best_score = sc
+                            best_hit = v.to_dict()
+                    if best_score >= 88:
+                        hit = best_hit
+
+                if hit is not None:
+                    if float(hit.get("DFS Projection", 0) or 0) > 0:
+                        pool.at[idx, "DFS Projection"] = float(hit.get("DFS Projection", pool.at[idx, "DFS Projection"]))
+                    pool.at[idx, "DFS Confidence"] = float(hit.get("DFS Confidence", pool.at[idx, "DFS Confidence"]) or pool.at[idx, "DFS Confidence"])
+                    pool.at[idx, "AI Confidence"] = float(hit.get("AI Confidence", pool.at[idx, "AI Confidence"]) or pool.at[idx, "AI Confidence"])
+                    pool.at[idx, "Edge %"] = float(hit.get("Edge %", 0) or 0)
+                    pool.at[idx, "Model Probability %"] = float(hit.get("Model Probability %", 50) or 50)
+                    pool.at[idx, "Market"] = hit.get("Market", pool.at[idx, "Market"])
+                    pool.at[idx, "Pick"] = hit.get("Pick", pool.at[idx, "Pick"])
+                    pool.at[idx, "Best Book"] = hit.get("Best Book", pool.at[idx, "Best Book"])
+                    pool.at[idx, "Best MN App"] = hit.get("Best MN App", pool.at[idx, "Best MN App"])
+                    pool.at[idx, "Best Odds"] = hit.get("Best Odds", pool.at[idx, "Best Odds"])
+        except Exception:
+            pass
+
+    pool["DFS Projection"] = pd.to_numeric(pool["DFS Projection"], errors="coerce").fillna(0)
+    pool["Floor"] = (pool["DFS Projection"] * 0.55).round(2)
+    pool["Ceiling"] = (pool["DFS Projection"] * 1.55).round(2)
+    pool["Base Score"] = (
+        pool["DFS Projection"] * 1.0
+        + pd.to_numeric(pool["DFS Confidence"], errors="coerce").fillna(50) * 0.05
+        + pd.to_numeric(pool["Edge %"], errors="coerce").fillna(0) * 0.25
+    )
+
+    return pool.sort_values(["Base Score", "DFS Projection", "Salary"], ascending=False).reset_index(drop=True)
+
+
+def salary_csv_summary(salary_df):
+    if salary_df is None or salary_df.empty:
+        return {"Rows": 0, "Positions": "", "Games": 0}
+
+    s = salary_df.copy()
+    pos = ""
+
+    if "DFS Position" in s.columns:
+        pos_counts = s["DFS Position"].apply(normalize_dk_position).value_counts().to_dict()
+        pos = " · ".join([f"{k}: {v}" for k, v in pos_counts.items()])
+
+    games = 0
+    if "DFS Game Info" in s.columns:
+        games = len([x for x in s["DFS Game Info"].dropna().astype(str).unique() if x.strip()])
+
+    return {"Rows": len(s), "Positions": pos, "Games": games}
+
+
+def render_csv_only_notice():
+    st.info("CSV-only mode: lineups are built strictly from the uploaded salary CSV. Betting/AI data is only used as an optional projection boost when names match.")
+
+
+
+# =========================================================
+# DFS V91 CSV STYLE AUTO-DETECT + SHOWDOWN OPTIMIZER
+# =========================================================
+
+def csv_game_count(salary_df):
+    if salary_df is None or salary_df.empty or "DFS Game Info" not in salary_df.columns:
+        return 0
+    return len([x for x in salary_df["DFS Game Info"].dropna().astype(str).unique() if x.strip()])
+
+
+def auto_style_from_csv(platform, sport, selected_style, salary_df):
+    games = csv_game_count(salary_df)
+
+    # If the salary file is one game, it is usually DK Showdown or FD Single Game.
+    if games == 1:
+        if platform == "DraftKings" and (platform, sport, "Showdown Captain") in DFS_ROSTER_RULES:
+            return "Showdown Captain"
+        if platform == "FanDuel" and (platform, sport, "Single Game MVP") in DFS_ROSTER_RULES:
+            return "Single Game MVP"
+
+    return selected_style
+
+
+def slot_adjusted_player(row, slot):
+    """
+    Applies captain/MVP rules in a simple usable way.
+    DK CPT usually costs 1.5x and scores 1.5x.
+    FD MVP usually scores boosted but salary is not multiplied.
+    """
+    r = dict(row)
+    slot_u = str(slot).upper()
+
+    if slot_u == "CPT":
+        r["Salary"] = int(round(float(r.get("Salary", 0) or 0) * 1.5))
+        r["DFS Projection"] = round(float(r.get("DFS Projection", 0) or 0) * 1.5, 2)
+        r["Ceiling"] = round(float(r.get("Ceiling", 0) or 0) * 1.5, 2)
+        r["Floor"] = round(float(r.get("Floor", 0) or 0) * 1.5, 2)
+        r["Roster Slot"] = "CPT"
+        return r
+
+    if slot_u == "MVP":
+        r["DFS Projection"] = round(float(r.get("DFS Projection", 0) or 0) * 2.0, 2)
+        r["Ceiling"] = round(float(r.get("Ceiling", 0) or 0) * 2.0, 2)
+        r["Floor"] = round(float(r.get("Floor", 0) or 0) * 2.0, 2)
+        r["Roster Slot"] = "MVP"
+        return r
+
+    r["Roster Slot"] = slot
+    return r
+
+
+def optimize_roster_by_slots_csv_v91(pool, platform, sport, style, salary_cap, build_type="Cash", max_lineups=5):
+    """
+    CSV-only optimizer that:
+    - Handles DK Showdown CPT salary multiplier
+    - Does not require salary coverage
+    - Uses uploaded CSV player pool directly
+    """
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules["slots"])
+
+    if pool is None or pool.empty:
+        return []
+
+    p = pool.copy()
+    p["Build Score"] = p.apply(lambda r: score_player_for_build(r, build_type), axis=1)
+    p["Value"] = p["Build Score"] / (pd.to_numeric(p["Salary"], errors="coerce").fillna(9999) / 1000)
+    p = p.sort_values(["Build Score", "Value", "DFS Projection"], ascending=False)
+
+    rows = p.to_dict("records")
+    lineups = []
+
+    # Restrictive slots first; captain first for showdown.
+    def slot_rank(s):
+        su = str(s).upper()
+        if su in ["CPT", "MVP"]:
+            return 0
+        if su in ["P", "QB", "G", "DST", "DEF"]:
+            return 1
+        if su in ["UTIL", "FLEX"]:
+            return 99
+        return 2
+
+    ordered_slots = sorted(slots, key=slot_rank)
+
+    for start_idx in range(min(len(rows), max_lineups * 80)):
+        used = set()
+        salary = 0
+        lineup_rows = []
+
+        ordered_rows = rows[start_idx:] + rows[:start_idx]
+
+        for slot in ordered_slots:
+            best = None
+            best_score = -999999
+
+            for cand in ordered_rows:
+                player = str(cand.get("Player", "")).strip()
+                if not player or player in used:
+                    continue
+
+                if not eligible_for_slot_v82(cand.get("Position", "UTIL"), slot, cand.get("Salary Source", "Uploaded CSV")):
+                    # For showdown utility/captain, every player is eligible.
+                    if str(slot).upper() not in ["CPT", "MVP", "UTIL"]:
+                        continue
+
+                adj = slot_adjusted_player(cand, slot)
+                cand_salary = int(adj.get("Salary", 0) or 0)
+
+                if salary + cand_salary > int(salary_cap):
+                    continue
+
+                raw_score = float(adj.get("DFS Projection", 0) or 0)
+                ceil_score = float(adj.get("Ceiling", 0) or 0)
+                val_score = raw_score / max(cand_salary / 1000, 1)
+
+                if str(build_type).lower() == "cash":
+                    score = raw_score * 1.2 + val_score * 0.6
+                elif str(build_type).lower() == "gpp":
+                    score = ceil_score * 1.1 + val_score * 0.3
+                else:
+                    score = ceil_score * 0.8 + val_score * 0.8
+
+                if score > best_score:
+                    best = adj
+                    best_score = score
+
+            if best is None:
+                break
+
+            lineup_rows.append(best)
+            used.add(str(best.get("Player", "")).strip())
+            salary += int(best.get("Salary", 0) or 0)
+
+        if len(lineup_rows) == len(slots):
+            key = tuple(sorted([f"{x.get('Roster Slot')}:{x.get('Player')}" for x in lineup_rows]))
+            if key in [l["Key"] for l in lineups]:
+                continue
+
+            lineups.append({
+                "Key": key,
+                "Build Type": build_type,
+                "Platform": platform,
+                "Sport": sport,
+                "Style": style,
+                "Salary Cap": int(salary_cap),
+                "Salary Used": int(salary),
+                "Salary Left": int(salary_cap) - int(salary),
+                "Players": lineup_rows,
+                "Projected": round(sum(float(x.get("DFS Projection", 0) or 0) for x in lineup_rows), 2),
+                "Ceiling": round(sum(float(x.get("Ceiling", 0) or 0) for x in lineup_rows), 2),
+                "Floor": round(sum(float(x.get("Floor", 0) or 0) for x in lineup_rows), 2),
+                "Avg Confidence": round(sum(float(x.get("DFS Confidence", 50) or 50) for x in lineup_rows) / len(lineup_rows), 1),
+            })
+
+        if len(lineups) >= max_lineups:
+            break
+
+    return sorted(lineups, key=lambda x: (x["Projected"], x["Salary Used"]), reverse=True)[:max_lineups]
+
+
+
+# =========================================================
+# DFS V92 DRAFTKINGS LOBBY AUTO MODE
+# =========================================================
+
+def dk_lobby_link_for_sport(sport="MLB"):
+    sport_code = dk_sport_code(sport)
+    return f"https://www.draftkings.com/lobby#/{sport_code}"
+
+
+def classify_dk_slate_from_salary_df(platform, sport, salary_df, selected_style="Classic"):
+    games = csv_game_count(salary_df)
+    if games == 1:
+        if platform == "DraftKings" and (platform, sport, "Showdown Captain") in DFS_ROSTER_RULES:
+            return "Showdown Captain"
+        if platform == "FanDuel" and (platform, sport, "Single Game MVP") in DFS_ROSTER_RULES:
+            return "Single Game MVP"
+    return selected_style
+
+
+def load_dk_lobby_slate_salaries(draft_group_id, sport="MLB"):
+    """
+    Loads the actual DK salary CSV from a draftGroupId.
+    """
+    if not draft_group_id:
+        return pd.DataFrame(), "", "No DraftKings draft group selected."
+
+    salary_url = dk_salary_url_for_draft_group(str(draft_group_id))
+    salary_df, msg = load_dk_salary_by_draft_group_v87(str(draft_group_id), sport=sport)
+
+    if not salary_df.empty:
+        salary_df["Salary Source Label"] = "DraftKings Lobby CSV"
+        return salary_df, salary_url, msg
+
+    return pd.DataFrame(), salary_url, msg
+
+
+def render_dk_slate_cards(slates, selected_id=None):
+    """
+    Compact slate preview table/cards for mobile.
+    """
+    if slates is None or slates.empty:
+        st.warning("No DraftKings slates found for this sport right now.")
+        return
+
+    show = slates.copy()
+    for col in ["Slate Name", "Games", "Start Time", "Draft Group ID"]:
+        if col not in show.columns:
+            show[col] = ""
+    safe_dataframe(
+        show[["Slate Name", "Games", "Start Time", "Draft Group ID"]].head(25),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_dk_links(draft_group_id, salary_url, sport="MLB"):
+    lobby_url = dk_lobby_link_for_sport(sport)
+    if draft_group_id:
+        st.markdown(f"[Open DraftKings Lobby]({lobby_url})")
+        st.markdown(f"[Open DraftKings salary CSV]({salary_url})")
+
+
+def render_dfs_dk_auto_builder(df):
+    st.header("DFS Builder")
+
+    platform = "DraftKings"
+
+    top1, top2 = st.columns(2)
+    with top1:
+        st.selectbox("Platform", ["DraftKings"], index=0, key="dfs_v92_platform_locked", disabled=True)
+    with top2:
+        sport = st.selectbox(
+            "Sport",
+            list(LEAGUES.keys()),
+            index=list(LEAGUES.keys()).index(st.session_state.get("dfs_mobile_sport", "MLB")) if st.session_state.get("dfs_mobile_sport", "MLB") in list(LEAGUES.keys()) else 0,
+            key="dfs_v92_sport",
+        )
+
+    st.session_state["dfs_mobile_sport"] = sport
+
+    st.info("Auto mode: the DFS Builder searches DraftKings slates, pulls the salary CSV itself, then builds lineups from that slate.")
+
+    dk_slates, dk_msg = discover_dk_slates_v86(sport)
+    if dk_slates.empty:
+        st.warning(dk_msg)
+        st.markdown(f"[Open DraftKings Lobby]({dk_lobby_link_for_sport(sport)})")
+        return
+
+    dk_slates = dk_slates.copy()
+    dk_slates["Games"] = pd.to_numeric(dk_slates["Games"], errors="coerce").fillna(0).astype(int)
+    dk_slates = dk_slates.sort_values(["Games", "Start Time"], ascending=[False, True]).reset_index(drop=True)
+
+    labels = dk_slates["Slate Label"].tolist()
+    selected_label = st.selectbox(
+        "DraftKings Slate",
+        labels,
+        index=0,
+        key=f"dfs_v92_dk_slate_{sport}",
+    )
+
+    selected_row = dk_slates[dk_slates["Slate Label"].eq(selected_label)].iloc[0]
+    draft_group_id = str(selected_row["Draft Group ID"])
+
+    salary_df, salary_url, salary_msg = load_dk_lobby_slate_salaries(draft_group_id, sport=sport)
+
+    with st.expander("DraftKings slate links"):
+        st.write(f"Draft Group ID: {draft_group_id}")
+        render_dk_links(draft_group_id, salary_url, sport=sport)
+        render_dk_slate_cards(dk_slates, selected_id=draft_group_id)
+
+    if salary_df.empty:
+        st.error("DraftKings slate found, but the salary CSV could not be loaded automatically. DraftKings may be blocking the salary endpoint for this slate.")
+        with st.expander("Advanced manual salary URL"):
+            manual_url = st.text_input("Manual salary CSV URL", value=salary_url, key=f"dfs_v92_manual_url_{sport}_{draft_group_id}")
+            if manual_url:
+                manual_df, manual_msg = read_dfs_salary_url_cached_v87(manual_url, platform="DraftKings")
+                if not manual_df.empty:
+                    st.success(manual_msg)
+                    salary_df = manual_df
+                    salary_url = manual_url
+                else:
+                    st.warning(manual_msg)
+        if salary_df.empty:
+            return
+    else:
+        st.success(salary_msg)
+
+    selected_style = classify_dk_slate_from_salary_df(platform, sport, salary_df, selected_style="Classic")
+    rules = dfs_get_rules(platform, sport, selected_style)
+
+    st.markdown(f"### {platform} {sport} {selected_style}")
+    st.caption(rules.get("description", ""))
+    st.write(f"**Roster:** {' · '.join(rules['slots'])}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        salary_cap = st.number_input(
+            "Salary Cap",
+            min_value=10000,
+            max_value=100000,
+            value=int(rules.get("cap", 50000)),
+            step=500,
+            key=f"dfs_v92_cap_{sport}_{draft_group_id}_{selected_style}",
+        )
+    with c2:
+        max_lineups = st.selectbox(
+            "Lineups",
+            [1, 3, 5, 10, 20],
+            index=2,
+            key=f"dfs_v92_count_{sport}_{draft_group_id}_{selected_style}",
+        )
+
+    pool = build_dfs_pool_from_salary_csv(
+        salary_df,
+        betting_df=df,
+        platform=platform,
+        sport=sport,
+        style=selected_style,
+    )
+
+    csv_summary = salary_csv_summary(salary_df)
+
+    c_pool1, c_pool2, c_pool3, c_pool4 = st.columns(4)
+    c_pool1.metric("DK Players", csv_summary["Rows"])
+    c_pool2.metric("Pool Used", len(pool) if pool is not None else 0)
+    c_pool3.metric("Games", csv_summary["Games"])
+    c_pool4.metric("Slots", len(rules["slots"]))
+
+    if csv_summary["Positions"]:
+        st.caption(f"Position coverage: {csv_summary['Positions']}")
+
+    build = st.radio(
+        "Build Type",
+        ["Cash", "GPP", "Contrarian"],
+        horizontal=True,
+        key=f"dfs_v92_build_type_{sport}_{draft_group_id}_{selected_style}",
+    )
+
+    if pool is None or pool.empty:
+        st.warning("No DFS pool could be built from this DraftKings salary CSV.")
+        return
+
+    lineups = optimize_roster_by_slots_csv_v91(
+        pool,
+        platform,
+        sport,
+        selected_style,
+        salary_cap,
+        build_type=build,
+        max_lineups=max_lineups,
+    )
+
+    render_dfs_pro_lineups(lineups)
+
+    with st.expander("Player Pool"):
+        safe_dataframe(
+            pool.sort_values(["Base Score", "DFS Projection", "Salary"], ascending=False),
+            cols=[
+                "Player", "Position", "Salary", "Team", "Matchup",
+                "DFS Projection", "Ceiling", "Floor", "Leverage",
+                "DFS Confidence", "Market", "Pick"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+
+# =========================================================
+# DFS V93 DRAFTKINGS-NATIVE HELPERS
+# =========================================================
+
+def dk_sport_code_v93(sport):
+    mapping = {
+        "MLB": "MLB",
+        "NBA": "NBA",
+        "WNBA": "WNBA",
+        "NFL": "NFL",
+        "NHL": "NHL",
+        "UFC/MMA": "MMA",
+        "MLS Soccer": "SOC",
+        "Soccer": "SOC",
+    }
+    return mapping.get(str(sport), str(sport).upper())
+
+
+def dk_lobby_url_v93(sport="MLB", draft_group_id=None):
+    sport_code = dk_sport_code_v93(sport)
+    if draft_group_id:
+        return f"https://www.draftkings.com/lobby#/{sport_code}?draftGroupId={draft_group_id}"
+    return f"https://www.draftkings.com/lobby#/{sport_code}"
+
+
+def find_first_key(obj, names):
+    if not isinstance(obj, dict):
+        return None
+    lower = {str(k).lower(): k for k in obj.keys()}
+    for name in names:
+        if str(name).lower() in lower:
+            return obj.get(lower[str(name).lower()])
+    return None
+
+
+def normalize_dk_draftable_position(raw):
+    txt = str(raw or "").upper().strip()
+    if not txt or txt in ["NAN", "NONE"]:
+        return "UTIL"
+    txt = txt.replace("UTIL/BN", "UTIL").replace("BN", "UTIL")
+    txt = txt.replace("SP", "P").replace("RP", "P")
+    parts = [p.strip() for p in re.split(r"[/,|]", txt) if p.strip()]
+    if "C" in parts and "1B" in parts:
+        return "C/1B"
+    priority = ["CPT", "MVP", "P", "C/1B", "C", "1B", "2B", "3B", "SS", "OF", "QB", "RB", "WR", "TE", "DST", "PG", "SG", "SF", "PF", "G", "F", "D", "UTIL"]
+    for p in priority:
+        if p in parts or p == txt:
+            if p in ["C", "1B"]:
+                return "C/1B"
+            return p
+    return parts[0] if parts else "UTIL"
+
+
+def extract_dk_player_name(d):
+    return (
+        find_first_key(d, ["displayName", "displayNameShort", "name", "fullName", "playerName", "firstLastName", "draftableName"])
+        or ""
+    )
+
+
+def extract_dk_salary(d):
+    val = find_first_key(d, ["salary", "Salary", "draftStatSalary"])
+    try:
+        return int(float(val))
+    except Exception:
+        return 0
+
+
+def extract_dk_position(d):
+    pos = find_first_key(d, ["position", "rosterSlot", "rosterPosition", "positionName", "playerPosition"])
+    if isinstance(pos, dict):
+        pos = find_first_key(pos, ["name", "displayName", "position"])
+    if isinstance(pos, list) and pos:
+        pos = pos[0]
+    return normalize_dk_draftable_position(pos)
+
+
+def extract_dk_team(d):
+    team = find_first_key(d, ["teamAbbreviation", "teamAbbrev", "team", "teamName"])
+    if isinstance(team, dict):
+        team = find_first_key(team, ["abbreviation", "name", "teamAbbrev"])
+    return str(team or "")
+
+
+def extract_dk_game_info(d):
+    gi = find_first_key(d, ["gameInfo", "game", "competition", "eventDescription", "gameDescription"])
+    if isinstance(gi, dict):
+        away = find_first_key(gi, ["awayTeam", "awayTeamAbbreviation", "awayTeamName"])
+        home = find_first_key(gi, ["homeTeam", "homeTeamAbbreviation", "homeTeamName"])
+        start = find_first_key(gi, ["startTime", "startDate", "startDateTime"])
+        if isinstance(away, dict):
+            away = find_first_key(away, ["abbreviation", "name"])
+        if isinstance(home, dict):
+            home = find_first_key(home, ["abbreviation", "name"])
+        if away and home:
+            return f"{away}@{home} {start or ''}".strip()
+    return str(gi or "")
+
+
+def extract_dk_status(d):
+    status = find_first_key(d, ["status", "playerStatus", "statusDisplay", "injuryStatus"])
+    if isinstance(status, dict):
+        status = find_first_key(status, ["status", "displayValue", "description"])
+    return str(status or "")
+
+
+def normalize_dk_draftables_payload(payload, platform="DraftKings", sport="MLB"):
+    """
+    Converts DraftKings draftables JSON into a salary/player pool dataframe.
+    Searches nested JSON for dicts that contain name + salary.
+    """
+    candidates = []
+    for item in flatten_json_items(payload):
+        if not isinstance(item, dict):
+            continue
+        name = extract_dk_player_name(item)
+        salary = extract_dk_salary(item)
+        if name and salary > 0:
+            candidates.append(item)
+
+    rows = []
+    seen = set()
+    for d in candidates:
+        name = extract_dk_player_name(d)
+        salary = extract_dk_salary(d)
+        pos = extract_dk_position(d)
+        team = extract_dk_team(d)
+        game_info = extract_dk_game_info(d)
+        status = extract_dk_status(d)
+        key = (normalize_player_name_for_join(name), salary, pos)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "DFS Name": name,
+            "Join Name": normalize_player_name_for_join(name),
+            "DFS Salary": salary,
+            "DFS Position": pos,
+            "DFS Team": team,
+            "DFS Game Info": game_info,
+            "DFS Status": status,
+            "Platform": platform,
+            "Salary Source Label": "DraftKings Draftables",
+        })
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_dk_json_cached(url):
+    try:
+        r = requests.get(
+            url,
+            timeout=(7, 25),
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://www.draftkings.com/",
+                "Origin": "https://www.draftkings.com",
+            },
+        )
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        try:
+            return r.json(), "OK"
+        except Exception:
+            return None, "Non-JSON response"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_dk_draftables_v93(draft_group_id, sport="MLB"):
+    """
+    Try multiple DraftKings draftables endpoint patterns.
+    If JSON endpoints fail, fallback internally to CSV endpoint.
+    """
+    if not draft_group_id:
+        return pd.DataFrame(), "", "No DraftKings draft group selected."
+
+    dg = str(draft_group_id)
+    endpoints = [
+        f"https://api.draftkings.com/draftgroups/v1/draftgroups/{dg}/draftables",
+        f"https://api.draftkings.com/draftgroups/v1/draftgroups/{dg}/draftables?format=json",
+        f"https://api.draftkings.com/draftgroups/v1/draftgroups/{dg}/players",
+        f"https://api.draftkings.com/lineups/v1/draftgroups/{dg}/draftables",
+        f"https://www.draftkings.com/lineup/getavailableplayers?draftGroupId={dg}",
+        f"https://www.draftkings.com/lineup/getavailableplayersjson?draftGroupId={dg}",
+    ]
+
+    errors = []
+    for url in endpoints:
+        payload, msg = get_dk_json_cached(url)
+        if payload is None:
+            errors.append(f"{url} -> {msg}")
+            continue
+        df = normalize_dk_draftables_payload(payload, platform="DraftKings", sport=sport)
+        if not df.empty:
+            return df, url, f"Loaded {len(df)} DraftKings draftables."
+
+        errors.append(f"{url} -> JSON found but no draftable salary rows recognized")
+
+    # Internal fallback: DK salary CSV endpoint.
+    salary_url = dk_salary_url_for_draft_group(dg)
+    csv_df, csv_msg = load_dk_salary_by_draft_group_v87(dg, sport=sport)
+    if not csv_df.empty:
+        csv_df["Salary Source Label"] = "DraftKings Salary CSV"
+        return csv_df, salary_url, f"Draftables JSON unavailable. Loaded {len(csv_df)} rows from DK salary CSV fallback."
+
+    return pd.DataFrame(), salary_url, "Could not load DraftKings draftables or salary CSV. DK may be blocking the endpoint for this slate."
+
+
+def classify_dk_style_v93(platform, sport, salary_df):
+    games = csv_game_count(salary_df)
+    if games == 1:
+        if (platform, sport, "Showdown Captain") in DFS_ROSTER_RULES:
+            return "Showdown Captain"
+    if (platform, sport, "Classic") in DFS_ROSTER_RULES:
+        return "Classic"
+    styles = dfs_available_styles(platform, sport)
+    return styles[0] if styles else "Classic"
+
+
+def slate_type_label_v93(row, salary_df=None):
+    name = str(row.get("Slate Name", "DraftKings Slate"))
+    games = row.get("Games", "")
+    start = row.get("Start Time", "")
+    dg = row.get("Draft Group ID", "")
+    return f"{name} • {games} games • {start} • ID {dg}"
+
+
+def render_dfs_dk_native_v93(df):
+    st.header("DFS Builder")
+
+    platform = "DraftKings"
+    top1, top2 = st.columns(2)
+    with top1:
+        st.selectbox("Platform", ["DraftKings"], index=0, key="dfs_v93_platform", disabled=True)
+    with top2:
+        sport = st.selectbox(
+            "Sport",
+            list(LEAGUES.keys()),
+            index=list(LEAGUES.keys()).index(st.session_state.get("dfs_v93_sport", "MLB")) if st.session_state.get("dfs_v93_sport", "MLB") in list(LEAGUES.keys()) else 0,
+            key="dfs_v93_sport",
+        )
+
+    st.info("DraftKings-native mode: select a slate, the app pulls DK draftable players/salaries directly, then builds lineups. No CSV upload.")
+
+    dk_slates, msg = discover_dk_slates_v86(sport)
+    if dk_slates.empty:
+        st.warning(msg)
+        st.markdown(f"[Open DraftKings Lobby]({dk_lobby_url_v93(sport)})")
+        return
+
+    dk_slates = dk_slates.copy()
+    dk_slates["Games"] = pd.to_numeric(dk_slates["Games"], errors="coerce").fillna(0).astype(int)
+    dk_slates = dk_slates.sort_values(["Games", "Start Time"], ascending=[False, True]).reset_index(drop=True)
+    dk_slates["V93 Label"] = dk_slates.apply(lambda r: slate_type_label_v93(r), axis=1)
+
+    selected_label = st.selectbox(
+        "DraftKings Slate",
+        dk_slates["V93 Label"].tolist(),
+        index=0,
+        key=f"dfs_v93_slate_{sport}",
+    )
+    selected_row = dk_slates[dk_slates["V93 Label"].eq(selected_label)].iloc[0]
+    draft_group_id = str(selected_row["Draft Group ID"])
+
+    salary_df, source_url, source_msg = load_dk_draftables_v93(draft_group_id, sport=sport)
+
+    with st.expander("DraftKings board links"):
+        st.write(f"Draft Group ID: {draft_group_id}")
+        st.markdown(f"[Open DraftKings Lobby]({dk_lobby_url_v93(sport, draft_group_id)})")
+        if source_url:
+            st.markdown(f"[Open DK data source]({source_url})")
+        render_dk_slate_cards(dk_slates, selected_id=draft_group_id)
+
+    if salary_df.empty:
+        st.error(source_msg)
+        st.caption("This means DraftKings is blocking or changing the public draftables feed for this slate.")
+        return
+
+    st.success(source_msg)
+
+    style = classify_dk_style_v93(platform, sport, salary_df)
+    rules = dfs_get_rules(platform, sport, style)
+
+    st.markdown(f"### {platform} {sport} {style}")
+    st.write(f"**Roster:** {' · '.join(rules['slots'])}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        salary_cap = st.number_input(
+            "Salary Cap",
+            min_value=10000,
+            max_value=100000,
+            value=int(rules.get("cap", 50000)),
+            step=500,
+            key=f"dfs_v93_cap_{sport}_{draft_group_id}_{style}",
+        )
+    with c2:
+        max_lineups = st.selectbox(
+            "Lineups",
+            [1, 3, 5, 10, 20],
+            index=2,
+            key=f"dfs_v93_count_{sport}_{draft_group_id}_{style}",
+        )
+
+    pool = build_dfs_pool_from_salary_csv(
+        salary_df,
+        betting_df=df,
+        platform=platform,
+        sport=sport,
+        style=style,
+    )
+
+    csv_summary = salary_csv_summary(salary_df)
+    c_pool1, c_pool2, c_pool3, c_pool4 = st.columns(4)
+    c_pool1.metric("DK Players", csv_summary["Rows"])
+    c_pool2.metric("Pool Used", len(pool))
+    c_pool3.metric("Games", csv_summary["Games"])
+    c_pool4.metric("Slots", len(rules["slots"]))
+
+    if csv_summary["Positions"]:
+        st.caption(f"Position coverage: {csv_summary['Positions']}")
+
+    build = st.radio(
+        "Build Type",
+        ["Cash", "GPP", "Contrarian"],
+        horizontal=True,
+        key=f"dfs_v93_build_{sport}_{draft_group_id}_{style}",
+    )
+
+    lineups = optimize_roster_by_slots_csv_v91(
+        pool,
+        platform,
+        sport,
+        style,
+        salary_cap,
+        build_type=build,
+        max_lineups=max_lineups,
+    )
+
+    render_dfs_pro_lineups(lineups)
+
+    with st.expander("Player Pool"):
+        safe_dataframe(
+            pool.sort_values(["Base Score", "DFS Projection", "Salary"], ascending=False),
+            cols=[
+                "Player", "Position", "Salary", "Team", "Matchup",
+                "DFS Projection", "Ceiling", "Floor", "Leverage",
+                "DFS Confidence", "Market", "Pick"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+
+# =========================================================
+# DFS V94 SOURCE ROUTER + ENDPOINT DEBUG
+# =========================================================
+
+def get_with_debug(url, expect_json=True):
+    info = {
+        "URL": url,
+        "Status": "",
+        "Content Type": "",
+        "Bytes": 0,
+        "OK": False,
+        "Reason": "",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            timeout=(8, 30),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/125 Safari/537.36",
+                "Accept": "application/json,text/csv,text/plain,*/*",
+                "Referer": "https://www.draftkings.com/",
+                "Origin": "https://www.draftkings.com",
+                "Cache-Control": "no-cache",
+            },
+        )
+        info["Status"] = r.status_code
+        info["Content Type"] = r.headers.get("content-type", "")
+        info["Bytes"] = len(r.content or b"")
+
+        if r.status_code != 200:
+            info["Reason"] = f"HTTP {r.status_code}"
+            return None, info
+
+        if expect_json:
+            try:
+                payload = r.json()
+                info["OK"] = True
+                info["Reason"] = "JSON loaded"
+                return payload, info
+            except Exception:
+                info["Reason"] = "Non-JSON response"
+                return None, info
+
+        text = r.text or ""
+        if "," in text and len(text) > 100:
+            info["OK"] = True
+            info["Reason"] = "CSV/text loaded"
+            return text, info
+
+        info["Reason"] = "Empty or non-CSV response"
+        return None, info
+
+    except Exception as e:
+        info["Reason"] = f"{type(e).__name__}: {e}"
+        return None, info
+
+
+def normalize_any_salary_payload_v94(payload, platform="DraftKings", sport="MLB"):
+    """
+    Accepts JSON payload, CSV text, or list/dict and returns normalized salary dataframe.
+    """
+    if payload is None:
+        return pd.DataFrame()
+
+    if isinstance(payload, str):
+        try:
+            from io import StringIO
+            raw = pd.read_csv(StringIO(payload))
+            return normalize_dfs_salary_dataframe_v87(raw, platform=platform)
+        except Exception:
+            return pd.DataFrame()
+
+    df = normalize_dk_draftables_payload(payload, platform=platform, sport=sport)
+    if not df.empty:
+        return df
+
+    # Some APIs return a top-level players list with slightly different names.
+    rows = []
+    for item in flatten_json_items(payload):
+        if not isinstance(item, dict):
+            continue
+        name = extract_dk_player_name(item)
+        salary = extract_dk_salary(item)
+        if name and salary:
+            rows.append(item)
+
+    if rows:
+        return normalize_dk_draftables_payload({"draftables": rows}, platform=platform, sport=sport)
+
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_custom_dfs_source_v94(draft_group_id, sport="MLB"):
+    """
+    Optional custom source owned by user.
+    Set DK_DFS_SALARY_API_URL in Streamlit secrets/env:
+      https://your-api.com/dk?sport={sport}&draft_group_id={draft_group_id}
+    """
+    template = os.environ.get("DK_DFS_SALARY_API_URL", "") or safe_get_secret("DK_DFS_SALARY_API_URL", "")
+    if not template:
+        return pd.DataFrame(), "", {"Reason": "No DK_DFS_SALARY_API_URL configured"}
+
+    url = template.format(sport=sport, draft_group_id=draft_group_id)
+    payload, info = get_with_debug(url, expect_json=not url.lower().endswith(".csv"))
+    df = normalize_any_salary_payload_v94(payload, platform="DraftKings", sport=sport)
+    if not df.empty:
+        df["Salary Source Label"] = "Custom DFS Source"
+    return df, url, info
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_dk_dfs_sources_v94(draft_group_id, sport="MLB"):
+    """
+    Central source router.
+    Returns: df, source_url, message, debug_rows
+    """
+    dg = str(draft_group_id)
+    debug_rows = []
+
+    # 1) Public DraftKings draftables endpoints.
+    json_urls = [
+        f"https://api.draftkings.com/draftgroups/v1/draftgroups/{dg}/draftables",
+        f"https://api.draftkings.com/draftgroups/v1/draftgroups/{dg}/draftables?format=json",
+        f"https://www.draftkings.com/lineup/getavailableplayers?draftGroupId={dg}",
+        f"https://www.draftkings.com/lineup/getavailableplayersjson?draftGroupId={dg}",
+    ]
+
+    for url in json_urls:
+        payload, info = get_with_debug(url, expect_json=True)
+        debug_rows.append(info)
+        df = normalize_any_salary_payload_v94(payload, platform="DraftKings", sport=sport)
+        if not df.empty:
+            df["Salary Source Label"] = "DraftKings Public JSON"
+            return df, url, f"Loaded {len(df)} DraftKings players from public JSON.", debug_rows
+
+    # 2) Public salary CSV fallback.
+    csv_urls = [
+        f"https://www.draftkings.com/lineup/getavailableplayerscsv?draftGroupId={dg}",
+        f"https://www.draftkings.com/lineup/getavailableplayerscsv?contestTypeId=0&draftGroupId={dg}",
+    ]
+
+    for url in csv_urls:
+        text, info = get_with_debug(url, expect_json=False)
+        debug_rows.append(info)
+        df = normalize_any_salary_payload_v94(text, platform="DraftKings", sport=sport)
+        if not df.empty:
+            df["Salary Source Label"] = "DraftKings Public CSV"
+            return df, url, f"Loaded {len(df)} DraftKings players from salary CSV.", debug_rows
+
+    # 3) User-owned custom API source.
+    custom_df, custom_url, custom_info = load_custom_dfs_source_v94(dg, sport)
+    if custom_url:
+        debug_rows.append(custom_info)
+    if not custom_df.empty:
+        return custom_df, custom_url, f"Loaded {len(custom_df)} players from custom DFS source.", debug_rows
+
+    return pd.DataFrame(), "", "DraftKings slate was found, but player/salary endpoints are blocked or unavailable from this app session.", debug_rows
+
+
+def render_dk_endpoint_debug_v94(debug_rows):
+    with st.expander("DK endpoint debug"):
+        if not debug_rows:
+            st.info("No endpoints tested yet.")
+            return
+        dbg = pd.DataFrame(debug_rows)
+        safe_dataframe(dbg, use_container_width=True, hide_index=True)
+        st.caption("If the lobby works but draftables/CSV endpoints fail, DraftKings is blocking or changing the player/salary feed. Use a custom authorized source/API for full automation.")
+
+
+def render_dk_blocked_next_steps_v94(sport, draft_group_id):
+    st.error("DraftKings found the slate, but blocked or did not return the player salary feed.")
+    st.markdown(
+        """
+**What this means:** the app can see the DK lobby, but DK is not allowing this Streamlit/Python session to read the salary/player feed.
+
+**Best practical no-hand-entry path:** generate lineups in the app, download the DK Lineups CSV, then use DraftKings' bulk upload page. That avoids typing players one by one.
+
+For fully automatic lineup generation, connect a legit salary feed source:
+- Your own backend/proxy that can access DK salary data
+- A paid DFS/salary data provider
+- An external scraper service you control
+
+Plug-in point: set `DK_DFS_SALARY_API_URL` and the app will use that automatically.
+"""
+    )
+    st.markdown(f"[Open DraftKings Lobby]({dk_lobby_url_v93(sport, draft_group_id)})")
+
+
+def render_dfs_dk_native_v94(df):
+    st.header("DFS Builder")
+
+    platform = "DraftKings"
+    c1, c2 = st.columns(2)
+    with c1:
+        st.selectbox("Platform", ["DraftKings"], index=0, disabled=True, key="dfs_v94_platform")
+    with c2:
+        sport = st.selectbox(
+            "Sport",
+            list(LEAGUES.keys()),
+            index=list(LEAGUES.keys()).index(st.session_state.get("dfs_v94_sport", "MLB")) if st.session_state.get("dfs_v94_sport", "MLB") in list(LEAGUES.keys()) else 0,
+            key="dfs_v94_sport",
+        )
+
+    st.info("V94: DraftKings lobby scan + source router. No CSV upload. If DK blocks salary feeds, endpoint debug shows exactly where it failed.")
+
+    dk_slates, msg = discover_dk_slates_v86(sport)
+    if dk_slates.empty:
+        st.warning(msg)
+        st.markdown(f"[Open DraftKings Lobby]({dk_lobby_url_v93(sport)})")
+        return
+
+    dk_slates = dk_slates.copy()
+    dk_slates["Games"] = pd.to_numeric(dk_slates["Games"], errors="coerce").fillna(0).astype(int)
+    dk_slates = dk_slates.sort_values(["Games", "Start Time"], ascending=[False, True]).reset_index(drop=True)
+    dk_slates["V94 Label"] = dk_slates.apply(lambda r: slate_type_label_v93(r), axis=1)
+
+    selected_label = st.selectbox("DraftKings Slate", dk_slates["V94 Label"].tolist(), index=0, key=f"dfs_v94_slate_{sport}")
+    selected_row = dk_slates[dk_slates["V94 Label"].eq(selected_label)].iloc[0]
+    draft_group_id = str(selected_row["Draft Group ID"])
+
+    salary_df, source_url, source_msg, debug_rows = load_dk_dfs_sources_v94(draft_group_id, sport=sport)
+
+    with st.expander("DraftKings board links"):
+        st.write(f"Draft Group ID: {draft_group_id}")
+        st.markdown(f"[Open DraftKings Lobby]({dk_lobby_url_v93(sport, draft_group_id)})")
+        if source_url:
+            st.markdown(f"[Open data source]({source_url})")
+        render_dk_slate_cards(dk_slates, selected_id=draft_group_id)
+
+    render_dk_endpoint_debug_v94(debug_rows)
+
+    if salary_df.empty:
+        render_dk_blocked_next_steps_v94(sport, draft_group_id)
+        return
+
+    st.success(source_msg)
+
+    style = classify_dk_style_v93(platform, sport, salary_df)
+    rules = dfs_get_rules(platform, sport, style)
+
+    st.markdown(f"### {platform} {sport} {style}")
+    st.write(f"**Roster:** {' · '.join(rules['slots'])}")
+
+    cap_col, cnt_col = st.columns(2)
+    with cap_col:
+        salary_cap = st.number_input(
+            "Salary Cap",
+            min_value=10000,
+            max_value=100000,
+            value=int(rules.get("cap", 50000)),
+            step=500,
+            key=f"dfs_v94_cap_{sport}_{draft_group_id}_{style}",
+        )
+    with cnt_col:
+        max_lineups = st.selectbox(
+            "Lineups",
+            [1, 3, 5, 10, 20],
+            index=2,
+            key=f"dfs_v94_count_{sport}_{draft_group_id}_{style}",
+        )
+
+    pool = build_dfs_pool_from_salary_csv(salary_df, betting_df=df, platform=platform, sport=sport, style=style)
+    csv_summary = salary_csv_summary(salary_df)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("DK Players", csv_summary["Rows"])
+    m2.metric("Pool Used", len(pool))
+    m3.metric("Games", csv_summary["Games"])
+    m4.metric("Slots", len(rules["slots"]))
+
+    if csv_summary["Positions"]:
+        st.caption(f"Position coverage: {csv_summary['Positions']}")
+
+    build = st.radio("Build Type", ["Cash", "GPP", "Contrarian"], horizontal=True, key=f"dfs_v94_build_{sport}_{draft_group_id}_{style}")
+
+    lineups = optimize_roster_by_slots_csv_v91(
+        pool,
+        platform,
+        sport,
+        style,
+        salary_cap,
+        build_type=build,
+        max_lineups=max_lineups,
+    )
+
+    render_dfs_pro_lineups(lineups)
+
+    with st.expander("Player Pool"):
+        safe_dataframe(
+            pool.sort_values(["Base Score", "DFS Projection", "Salary"], ascending=False),
+            cols=[
+                "Player", "Position", "Salary", "Team", "Matchup",
+                "DFS Projection", "Ceiling", "Floor", "Leverage",
+                "DFS Confidence", "Market", "Pick"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+
+# =========================================================
+# V95 SAFE SECRETS HELPER
+# =========================================================
+
+def safe_get_secret(name, default=""):
+    """
+    Streamlit raises StreamlitSecretNotFoundError if no secrets.toml exists.
+    This helper makes secrets optional.
+    """
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+
+# =========================================================
+# DFS V96 DRAFTKINGS BULK UPLOAD EXPORT
+# =========================================================
+
+def dk_lineup_upload_url():
+    return "https://www.draftkings.com/lineup"
+
+
+def lineup_to_dk_upload_rows(lineups):
+    """
+    Create a simple DraftKings bulk-upload style CSV.
+    DraftKings upload templates can vary by sport/style, so V96 outputs:
+    - Lineup #
+    - roster slot columns in order
+    - optional metadata columns
+    The player values use names as displayed in the optimizer.
+
+    For best DK compatibility, use the same slate/style that DK's upload page expects.
+    """
+    if not lineups:
+        return pd.DataFrame()
+
+    rows = []
+    for i, lu in enumerate(lineups, start=1):
+        row = {
+            "Lineup": i,
+            "Build Type": lu.get("Build Type", ""),
+            "Platform": lu.get("Platform", "DraftKings"),
+            "Sport": lu.get("Sport", ""),
+            "Style": lu.get("Style", ""),
+            "Salary Used": lu.get("Salary Used", ""),
+            "Salary Left": lu.get("Salary Left", ""),
+            "Projected": lu.get("Projected", ""),
+            "Ceiling": lu.get("Ceiling", ""),
+        }
+
+        players = lu.get("Players", [])
+        slot_counts = {}
+
+        for p in players:
+            slot = str(p.get("Roster Slot", p.get("Position", "UTIL")) or "UTIL").upper()
+            slot_counts[slot] = slot_counts.get(slot, 0) + 1
+            col = slot if slot_counts[slot] == 1 else f"{slot}{slot_counts[slot]}"
+            row[col] = p.get("Player", "")
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def render_dk_bulk_upload_tools(lineups, key_prefix="dk_bulk"):
+    if not lineups:
+        return
+
+    export_df = lineup_to_dk_upload_rows(lineups)
+    if export_df.empty:
+        return
+
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+
+    st.markdown("### DraftKings Bulk Upload")
+    st.caption("Download this CSV, then upload it on DraftKings Lineups. This avoids hand-entering every player.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download DK Lineups CSV",
+            data=csv_bytes,
+            file_name="cd_betting_dk_lineups.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"{key_prefix}_download_csv",
+        )
+    with c2:
+        st.link_button(
+            "Open DraftKings Lineups",
+            dk_lineup_upload_url(),
+            use_container_width=True,
+        )
+
+    with st.expander("Export Preview"):
+        safe_dataframe(export_df, use_container_width=True, hide_index=True)
+
+
+
+# =========================================================
+# DFS V97 SIMPLE CSV RUNNER
+# =========================================================
+
+def render_dfs_simple_csv_v97(df):
+    st.header("DFS Builder")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        platform = st.selectbox(
+            "Platform",
+            ["DraftKings", "FanDuel"],
+            index=0,
+            key="dfs_v97_platform",
+        )
+    with c2:
+        sport = st.selectbox(
+            "Sport",
+            list(LEAGUES.keys()),
+            index=list(LEAGUES.keys()).index(st.session_state.get("dfs_v97_sport", "MLB")) if st.session_state.get("dfs_v97_sport", "MLB") in list(LEAGUES.keys()) else 0,
+            key="dfs_v97_sport",
+        )
+
+    st.info("Upload the DraftKings/FanDuel salary CSV and run it. No slate selector, no DK endpoint scan, no salary matching gate.")
+
+    uploaded_salary = st.file_uploader(
+        "Upload salary CSV",
+        type=["csv"],
+        key=f"dfs_v97_salary_csv_{platform}_{sport}",
+    )
+
+    if uploaded_salary is None:
+        st.warning("Upload a salary CSV to build lineups.")
+        return
+
+    salary_df = read_dfs_salary_file_v87(uploaded_salary, platform)
+
+    if salary_df.empty:
+        st.error("CSV uploaded, but I could not read player name, position, and salary columns.")
+        return
+
+    style_options = dfs_available_styles(platform, sport)
+    default_style = "Classic" if "Classic" in style_options else (style_options[0] if style_options else "Classic")
+
+    detected_style = auto_style_from_csv(platform, sport, default_style, salary_df)
+    if detected_style not in style_options and style_options:
+        detected_style = default_style
+
+    st.success(f"Loaded {len(salary_df)} players from uploaded CSV.")
+
+    style = st.selectbox(
+        "DFS Style",
+        style_options if style_options else [detected_style],
+        index=(style_options.index(detected_style) if detected_style in style_options else 0),
+        key=f"dfs_v97_style_{platform}_{sport}",
+    )
+
+    rules = dfs_get_rules(platform, sport, style)
+
+    st.markdown(f"### {platform} {sport} {style}")
+    st.caption(rules.get("description", ""))
+    st.write(f"**Roster:** {' · '.join(rules['slots'])}")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        salary_cap = st.number_input(
+            "Salary Cap",
+            min_value=10000,
+            max_value=100000,
+            value=int(rules.get("cap", 50000)),
+            step=500,
+            key=f"dfs_v97_cap_{platform}_{sport}_{style}",
+        )
+    with c4:
+        max_lineups = st.selectbox(
+            "Lineups",
+            [1, 3, 5, 10, 20],
+            index=2,
+            key=f"dfs_v97_count_{platform}_{sport}_{style}",
+        )
+
+    min_salary_pct = st.slider(
+        "Minimum salary spend target",
+        min_value=0.70,
+        max_value=1.00,
+        value=0.95,
+        step=0.01,
+        key=f"dfs_v102_min_spend_{platform}_{sport}_{style}",
+    )
+
+    pool = build_dfs_pool_from_salary_csv(
+        salary_df,
+        betting_df=df,
+        platform=platform,
+        sport=sport,
+        style=style,
+    )
+
+    csv_summary = salary_csv_summary(salary_df)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("CSV Players", csv_summary["Rows"])
+    m2.metric("Pool Used", len(pool))
+    m3.metric("Games", csv_summary["Games"])
+    m4.metric("Slots", len(rules["slots"]))
+
+    if csv_summary["Positions"]:
+        st.caption(f"Position coverage: {csv_summary['Positions']}")
+
+    build = st.radio(
+        "Build Type",
+        ["Cash", "GPP", "Contrarian"],
+        horizontal=True,
+        key=f"dfs_v97_build_{platform}_{sport}_{style}",
+    )
+
+    if pool is None or pool.empty:
+        st.warning("No usable DFS pool was created from this CSV.")
+        return
+
+    render_optimizer_debug_v102(pool, platform, sport, style, salary_cap)
+
+    run_build = st.button(
+        "Build Best Lineups",
+        type="primary",
+        use_container_width=True,
+        key=f"dfs_v102_build_button_{platform}_{sport}_{style}_{build}",
+    )
+
+    if not run_build:
+        st.info("Choose your settings, then click Build Best Lineups.")
+        lineups = []
+    else:
+        with st.spinner("Building best lineups..."):
+            lineups = optimize_best_lineups_v103(
+                pool,
+                platform,
+                sport,
+                style,
+                salary_cap,
+                build_type=build,
+                max_lineups=max_lineups,
+                min_salary_pct=min_salary_pct,
+            )
+
+        if not lineups:
+            st.warning("No valid lineup fit. Open Optimizer Debug - troubleshooting only to see the exact reason.")
+        else:
+            render_best_outcome_summary_v102(lineups)
+            render_lineup_quality_note_v102(lineups, salary_cap, min_salary_pct)
+            render_dfs_pro_lineups(lineups)
+
+    with st.expander("Player Pool"):
+        safe_dataframe(
+            pool.sort_values(["Base Score", "DFS Projection", "Salary"], ascending=False),
+            cols=[
+                "Player", "Position", "Salary", "Team", "Matchup",
+                "DFS Projection", "Ceiling", "Floor", "Leverage",
+                "DFS Confidence", "Market", "Pick"
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+
+# =========================================================
+# DFS V98 OPTIMIZER DEBUG + RELAXED CSV OPTIMIZER
+# =========================================================
+
+def pos_tokens_v98(pos):
+    txt = str(pos or "UTIL").upper().strip()
+    if not txt:
+        return {"UTIL"}
+    parts = set([p.strip() for p in re.split(r"[/,|]", txt) if p.strip()])
+    if txt == "C/1B" or ("C" in parts and "1B" in parts):
+        parts.update(["C", "1B", "C/1B"])
+    if not parts:
+        parts.add(txt)
+    return parts
+
+
+def eligible_for_slot_v98(pos, slot):
+    slot = str(slot or "UTIL").upper().strip()
+    toks = pos_tokens_v98(pos)
+
+    if slot in ["UTIL", "FLEX"]:
+        # MLB UTIL can be any hitter, not pitcher.
+        return "P" not in toks
+
+    if slot == "C/1B":
+        return bool(toks & {"C", "1B", "C/1B"})
+
+    if slot == "P":
+        return "P" in toks
+
+    if slot == "OF":
+        return "OF" in toks
+
+    return slot in toks
+
+
+def dfs_optimizer_diagnostics_v98(pool, platform, sport, style, salary_cap):
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules.get("slots", []))
+
+    diag = {
+        "Players entering optimizer": 0,
+        "Salary Cap": salary_cap,
+        "Slots": " · ".join(slots),
+        "Position Counts": "",
+        "Salary Min": 0,
+        "Salary Median": 0,
+        "Salary Max": 0,
+        "Cheapest Slot Fill Estimate": 0,
+        "Likely Fail Reason": "",
+    }
+
+    if pool is None or pool.empty:
+        diag["Likely Fail Reason"] = "Player pool is empty."
+        return diag, pd.DataFrame()
+
+    p = pool.copy()
+    p["Salary"] = pd.to_numeric(p.get("Salary", 0), errors="coerce").fillna(0).astype(int)
+    p = p[p["Salary"] > 0].copy()
+
+    diag["Players entering optimizer"] = len(p)
+
+    if p.empty:
+        diag["Likely Fail Reason"] = "All salaries are zero or missing."
+        return diag, pd.DataFrame()
+
+    pos_counts = p["Position"].astype(str).apply(normalize_dk_position).value_counts().to_dict()
+    diag["Position Counts"] = " · ".join([f"{k}: {v}" for k, v in pos_counts.items()])
+    diag["Salary Min"] = int(p["Salary"].min())
+    diag["Salary Median"] = int(p["Salary"].median())
+    diag["Salary Max"] = int(p["Salary"].max())
+
+    used = set()
+    cheapest_rows = []
+    total = 0
+
+    # Fill hardest slots first.
+    ordered_slots = sorted(slots, key=lambda s: 99 if str(s).upper() in ["UTIL", "FLEX"] else 0)
+
+    for slot in ordered_slots:
+        elig = p[p.apply(lambda r: eligible_for_slot_v98(r.get("Position", "UTIL"), slot), axis=1)].copy()
+        elig = elig[~elig["Player"].astype(str).isin(used)]
+        if elig.empty:
+            diag["Likely Fail Reason"] = f"No eligible players found for slot {slot}."
+            return diag, pd.DataFrame(cheapest_rows)
+
+        row = elig.sort_values("Salary", ascending=True).iloc[0]
+        used.add(str(row["Player"]))
+        total += int(row["Salary"])
+        cheapest_rows.append({
+            "Slot": slot,
+            "Player": row.get("Player", ""),
+            "Position": row.get("Position", ""),
+            "Salary": int(row.get("Salary", 0)),
+        })
+
+    diag["Cheapest Slot Fill Estimate"] = int(total)
+
+    if total > int(salary_cap):
+        diag["Likely Fail Reason"] = f"Cheapest legal lineup costs ${total:,}, above the ${int(salary_cap):,} cap."
+    else:
+        diag["Likely Fail Reason"] = "A legal lineup appears possible. If no lineup built, old optimizer slot logic was rejecting valid combinations."
+
+    return diag, pd.DataFrame(cheapest_rows)
+
+
+def render_optimizer_debug_v102(pool, platform, sport, style, salary_cap):
+    diag, cheapest = dfs_optimizer_diagnostics_v98(pool, platform, sport, style, salary_cap)
+
+    with st.expander("Optimizer Debug", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Players In", diag["Players entering optimizer"])
+        c2.metric("Cheapest Legal", f"${int(diag['Cheapest Slot Fill Estimate']):,}")
+        c3.metric("Cap", f"${int(salary_cap):,}")
+
+        st.write(f"**Slots:** {diag['Slots']}")
+        st.write(f"**Position counts:** {diag['Position Counts']}")
+        st.write(
+            f"**Salary range:** ${int(diag['Salary Min']):,} / "
+            f"${int(diag['Salary Median']):,} median / ${int(diag['Salary Max']):,}"
+        )
+        st.write(f"**Likely fail reason:** {diag['Likely Fail Reason']}")
+
+        if not cheapest.empty:
+            st.markdown("##### Cheapest possible slot fill")
+            safe_dataframe(cheapest, use_container_width=True, hide_index=True)
+
+    return diag
+
+
+def optimize_roster_by_slots_csv_v98(pool, platform, sport, style, salary_cap, build_type="Cash", max_lineups=5):
+    """
+    Relaxed optimizer for uploaded CSVs.
+    It is intentionally simple and robust:
+    - no salary coverage gate
+    - correct C/1B and UTIL eligibility
+    - fills hard slots first
+    - produces multiple lineups by rotating starting candidates
+    """
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules.get("slots", []))
+
+    if pool is None or pool.empty or not slots:
+        return []
+
+    p = pool.copy()
+    p["Salary"] = pd.to_numeric(p.get("Salary", 0), errors="coerce").fillna(0).astype(int)
+    p = p[p["Salary"] > 0].copy()
+    if p.empty:
+        return []
+
+    for col in ["DFS Projection", "Ceiling", "Floor", "DFS Confidence", "Leverage"]:
+        if col not in p.columns:
+            p[col] = 0
+        p[col] = pd.to_numeric(p[col], errors="coerce").fillna(0)
+
+    p["Build Score"] = p.apply(lambda r: score_player_for_build(r, build_type), axis=1)
+    p["Value Score"] = p["Build Score"] / (p["Salary"].replace(0, 9999) / 1000)
+
+    if str(build_type).lower() == "cash":
+        p = p.sort_values(["Value Score", "DFS Projection", "Build Score"], ascending=False)
+    elif str(build_type).lower() == "gpp":
+        p = p.sort_values(["Ceiling", "Build Score", "Value Score"], ascending=False)
+    else:
+        p = p.sort_values(["Leverage", "Ceiling", "Value Score"], ascending=False)
+
+    rows = p.to_dict("records")
+    lineups = []
+    seen_keys = set()
+
+    def slot_hardness(slot):
+        slot_u = str(slot).upper()
+        if slot_u in ["UTIL", "FLEX"]:
+            return 99
+        return len([r for r in rows if eligible_for_slot_v98(r.get("Position", "UTIL"), slot)])
+
+    ordered_slots = sorted(slots, key=slot_hardness)
+
+    # Rotate pool to create different lineups.
+    max_attempts = min(len(rows), max(250, max_lineups * 80))
+
+    for start in range(max_attempts):
+        rotated = rows[start:] + rows[:start]
+        selected = []
+        used_players = set()
+        salary_used = 0
+
+        for slot in ordered_slots:
+            best = None
+            best_rank = -10**18
+
+            for cand in rotated:
+                player = str(cand.get("Player", "")).strip()
+                if not player or player in used_players:
+                    continue
+
+                if not eligible_for_slot_v98(cand.get("Position", "UTIL"), slot):
+                    continue
+
+                adj = slot_adjusted_player(cand, slot) if "slot_adjusted_player" in globals() else dict(cand)
+                adj["Roster Slot"] = slot
+
+                cand_salary = int(adj.get("Salary", 0) or 0)
+                if salary_used + cand_salary > int(salary_cap):
+                    continue
+
+                # Prefer high value while also getting close to cap.
+                proj = float(adj.get("DFS Projection", 0) or 0)
+                ceil = float(adj.get("Ceiling", 0) or 0)
+                build_score = float(cand.get("Build Score", 0) or 0)
+                value = build_score / max(cand_salary / 1000, 1)
+
+                if str(build_type).lower() == "cash":
+                    rank = value * 2.0 + proj * 0.7
+                elif str(build_type).lower() == "gpp":
+                    rank = ceil * 1.2 + value * 0.5
+                else:
+                    rank = float(cand.get("Leverage", 0) or 0) * 2.0 + ceil * 0.8 + value * 0.4
+
+                # Minor penalty for leaving too much salary when near final slots.
+                rank -= max((salary_used + cand_salary) - int(salary_cap), 0) * 1000
+
+                if rank > best_rank:
+                    best_rank = rank
+                    best = adj
+
+            if best is None:
+                break
+
+            selected.append(best)
+            used_players.add(str(best.get("Player", "")).strip())
+            salary_used += int(best.get("Salary", 0) or 0)
+
+        if len(selected) != len(slots):
+            continue
+
+        key = tuple(sorted([str(x.get("Player", "")) for x in selected]))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        lineups.append({
+            "Key": key,
+            "Build Type": build_type,
+            "Platform": platform,
+            "Sport": sport,
+            "Style": style,
+            "Salary Cap": int(salary_cap),
+            "Salary Used": int(salary_used),
+            "Salary Left": int(salary_cap) - int(salary_used),
+            "Players": selected,
+            "Projected": round(sum(float(x.get("DFS Projection", 0) or 0) for x in selected), 2),
+            "Ceiling": round(sum(float(x.get("Ceiling", 0) or 0) for x in selected), 2),
+            "Floor": round(sum(float(x.get("Floor", 0) or 0) for x in selected), 2),
+            "Avg Confidence": round(sum(float(x.get("DFS Confidence", 50) or 50) for x in selected) / len(selected), 1),
+        })
+
+        if len(lineups) >= int(max_lineups):
+            break
+
+    return sorted(lineups, key=lambda x: (x["Projected"], -x["Salary Left"]), reverse=True)[:int(max_lineups)]
+
+
+
+# =========================================================
+# DFS V102 FAST BEST-LINEUP OPTIMIZER
+# =========================================================
+
+def render_optimizer_debug_v102(pool, platform, sport, style, salary_cap):
+    diag, cheapest = dfs_optimizer_diagnostics_v98(pool, platform, sport, style, salary_cap)
+
+    with st.expander("Optimizer Debug - troubleshooting only", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Players In", diag["Players entering optimizer"])
+        c2.metric("Cheapest Legal", f"${int(diag['Cheapest Slot Fill Estimate']):,}")
+        c3.metric("Cap", f"${int(salary_cap):,}")
+
+        st.write(f"**Slots:** {diag['Slots']}")
+        st.write(f"**Position counts:** {diag['Position Counts']}")
+        st.write(
+            f"**Salary range:** ${int(diag['Salary Min']):,} / "
+            f"${int(diag['Salary Median']):,} median / ${int(diag['Salary Max']):,}"
+        )
+        st.write(f"**Fail check:** {diag['Likely Fail Reason']}")
+
+        if not cheapest.empty:
+            st.caption("Diagnostic only. This is NOT the recommended lineup.")
+            safe_dataframe(cheapest, use_container_width=True, hide_index=True)
+
+    return diag
+
+
+def optimize_fast_best_lineups_v102(pool, platform, sport, style, salary_cap, build_type="Cash", max_lineups=5, min_salary_pct=0.95):
+    """
+    Fast optimizer for Streamlit:
+    - Projection-first
+    - Tries to spend at least min_salary_pct of cap
+    - Capped attempts so app does not freeze
+    """
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules.get("slots", []))
+
+    if pool is None or pool.empty or not slots:
+        return []
+
+    p = pool.copy()
+    p["Salary"] = pd.to_numeric(p.get("Salary", 0), errors="coerce").fillna(0).astype(int)
+    p = p[p["Salary"] > 0].copy()
+    if p.empty:
+        return []
+
+    for col in ["DFS Projection", "Ceiling", "Floor", "DFS Confidence", "Leverage"]:
+        if col not in p.columns:
+            p[col] = 0
+        p[col] = pd.to_numeric(p[col], errors="coerce").fillna(0)
+
+    p["Value"] = p["DFS Projection"] / (p["Salary"].replace(0, 9999) / 1000)
+
+    if str(build_type).lower() == "cash":
+        p["Rank"] = p["DFS Projection"] * 100 + p["DFS Confidence"] * 0.25 + p["Value"] * 0.5
+    elif str(build_type).lower() == "gpp":
+        p["Rank"] = p["DFS Projection"] * 70 + p["Ceiling"] * 35 + p["Leverage"] * 1.0
+    else:
+        p["Rank"] = p["DFS Projection"] * 65 + p["Ceiling"] * 25 + p["Leverage"] * 8
+
+    # Keep top players per position group so optimizer is fast.
+    keep_frames = []
+    for slot in set(slots + ["UTIL"]):
+        elig = p[p.apply(lambda r: eligible_for_slot_v98(r.get("Position", "UTIL"), slot), axis=1)].copy()
+        if not elig.empty:
+            keep_frames.append(elig.sort_values("Rank", ascending=False).head(80))
+    if keep_frames:
+        p = pd.concat(keep_frames, ignore_index=True).drop_duplicates(subset=["Player", "Salary", "Position"])
+
+    rows = p.sort_values(["Rank", "DFS Projection", "Salary"], ascending=False).to_dict("records")
+    min_spend = int(float(salary_cap) * float(min_salary_pct))
+
+    def slot_hardness(slot):
+        if str(slot).upper() in ["UTIL", "FLEX"]:
+            return 99999
+        return len([r for r in rows if eligible_for_slot_v98(r.get("Position", "UTIL"), slot)])
+
+    ordered_slots = sorted(slots, key=slot_hardness)
+
+    def build_one(offset):
+        rotated = rows[offset:] + rows[:offset]
+        selected = []
+        used = set()
+        salary_used = 0
+
+        for slot in ordered_slots:
+            best = None
+            best_score = -10**18
+            remaining_slots = ordered_slots[ordered_slots.index(slot)+1:]
+
+            for cand in rotated:
+                player = str(cand.get("Player", "")).strip()
+                if not player or player in used:
+                    continue
+                if not eligible_for_slot_v98(cand.get("Position", "UTIL"), slot):
+                    continue
+
+                adj = slot_adjusted_player(cand, slot) if "slot_adjusted_player" in globals() else dict(cand)
+                adj["Roster Slot"] = slot
+                sal = int(adj.get("Salary", 0) or 0)
+
+                if salary_used + sal > int(salary_cap):
+                    continue
+
+                # quick remaining-slot feasibility
+                temp_used = used | {player}
+                temp_salary = salary_used + sal
+                min_remaining = 0
+                feasible = True
+                for rem in remaining_slots:
+                    rem_elig = [
+                        r for r in rows
+                        if str(r.get("Player", "")).strip() not in temp_used
+                        and eligible_for_slot_v98(r.get("Position", "UTIL"), rem)
+                    ]
+                    if not rem_elig:
+                        feasible = False
+                        break
+                    min_remaining += min(int(r.get("Salary", 0) or 0) for r in rem_elig)
+                if not feasible or temp_salary + min_remaining > int(salary_cap):
+                    continue
+
+                proj = float(adj.get("DFS Projection", 0) or 0)
+                ceil = float(adj.get("Ceiling", 0) or 0)
+                lev = float(adj.get("Leverage", 0) or 0)
+                val = float(cand.get("Value", 0) or 0)
+
+                if str(build_type).lower() == "cash":
+                    score = proj * 1000 + val * 2
+                elif str(build_type).lower() == "gpp":
+                    score = proj * 700 + ceil * 350 + lev * 10
+                else:
+                    score = proj * 650 + ceil * 250 + lev * 100
+
+                # spend-up pressure
+                if temp_salary + min_remaining < min_spend:
+                    score += sal * 0.6
+                else:
+                    score += sal * 0.05
+
+                if score > best_score:
+                    best_score = score
+                    best = adj
+
+            if best is None:
+                return None
+
+            selected.append(best)
+            used.add(str(best.get("Player", "")).strip())
+            salary_used += int(best.get("Salary", 0) or 0)
+
+        return selected if len(selected) == len(slots) else None
+
+    lineups = []
+    seen = set()
+    max_attempts = min(len(rows), 240)
+
+    for offset in range(max_attempts):
+        selected = build_one(offset)
+        if not selected:
+            continue
+
+        salary_used = sum(int(x.get("Salary", 0) or 0) for x in selected)
+        key = tuple(sorted([str(x.get("Player", "")) for x in selected]))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        projected = sum(float(x.get("DFS Projection", 0) or 0) for x in selected)
+        ceiling = sum(float(x.get("Ceiling", 0) or 0) for x in selected)
+        floor = sum(float(x.get("Floor", 0) or 0) for x in selected)
+        avg_conf = sum(float(x.get("DFS Confidence", 50) or 50) for x in selected) / len(selected)
+
+        rank = projected * 10000 + ceiling * 100
+        if salary_used < min_spend:
+            rank -= (min_spend - salary_used) * 20
+        else:
+            rank += salary_used
+
+        lineups.append({
+            "Key": key,
+            "Build Type": build_type,
+            "Platform": platform,
+            "Sport": sport,
+            "Style": style,
+            "Salary Cap": int(salary_cap),
+            "Salary Used": int(salary_used),
+            "Salary Left": int(salary_cap) - int(salary_used),
+            "Players": selected,
+            "Projected": round(projected, 2),
+            "Ceiling": round(ceiling, 2),
+            "Floor": round(floor, 2),
+            "Avg Confidence": round(avg_conf, 1),
+            "_Rank": rank,
+        })
+
+        if len(lineups) >= int(max_lineups) * 5:
+            break
+
+    good_spend = [x for x in lineups if int(x["Salary Used"]) >= min_spend]
+    rank_pool = good_spend if good_spend else lineups
+
+    return sorted(rank_pool, key=lambda x: (x["_Rank"], x["Projected"], x["Salary Used"]), reverse=True)[:int(max_lineups)]
+
+
+def render_best_outcome_summary_v102(lineups):
+    if not lineups:
+        return
+    best = lineups[0]
+    st.markdown("### Best Possible Outcomes")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Best Projection", best.get("Projected", 0))
+    c2.metric("Ceiling", best.get("Ceiling", 0))
+    c3.metric("Salary Used", f"${int(best.get('Salary Used', 0)):,}")
+    c4.metric("Salary Left", f"${int(best.get('Salary Left', 0)):,}")
+
+
+def render_lineup_quality_note_v102(lineups, salary_cap, min_salary_pct):
+    if not lineups:
+        return
+    min_spend = int(float(salary_cap) * float(min_salary_pct))
+    low = [lu for lu in lineups if int(lu.get("Salary Used", 0)) < min_spend]
+    if low:
+        st.warning(f"{len(low)} lineup(s) are below your spend target of ${min_spend:,}.")
+    else:
+        st.success(f"Lineups meet your spend target of ${min_spend:,}.")
+
+
+
+# =========================================================
+# DFS V103 ROBUST BEST-LINEUP OPTIMIZER
+# =========================================================
+
+import random
+import itertools
+
+
+def player_key_v103(row):
+    return str(row.get("Player", "")).strip().lower()
+
+
+def build_lineup_from_order_v103(rows, slots, salary_cap):
+    selected = []
+    used = set()
+    salary_used = 0
+
+    # Hardest slots first, UTIL last.
+    ordered_slots = sorted(
+        list(slots),
+        key=lambda s: 999 if str(s).upper() in ["UTIL", "FLEX"] else 0
+    )
+
+    for slot in ordered_slots:
+        chosen = None
+
+        for cand in rows:
+            pk = player_key_v103(cand)
+            if not pk or pk in used:
+                continue
+
+            if not eligible_for_slot_v98(cand.get("Position", "UTIL"), slot):
+                continue
+
+            adj = slot_adjusted_player(cand, slot) if "slot_adjusted_player" in globals() else dict(cand)
+            adj["Roster Slot"] = slot
+
+            sal = int(adj.get("Salary", 0) or 0)
+            if sal <= 0:
+                continue
+
+            if salary_used + sal > int(salary_cap):
+                continue
+
+            chosen = adj
+            break
+
+        if chosen is None:
+            return None
+
+        selected.append(chosen)
+        used.add(player_key_v103(chosen))
+        salary_used += int(chosen.get("Salary", 0) or 0)
+
+    return selected
+
+
+def lineup_score_v103(lineup, salary_cap, min_spend, build_type):
+    if not lineup:
+        return -10**18
+
+    salary_used = sum(int(x.get("Salary", 0) or 0) for x in lineup)
+    if salary_used > int(salary_cap):
+        return -10**18
+
+    proj = sum(float(x.get("DFS Projection", 0) or 0) for x in lineup)
+    ceil = sum(float(x.get("Ceiling", 0) or 0) for x in lineup)
+    floor = sum(float(x.get("Floor", 0) or 0) for x in lineup)
+    lev = sum(float(x.get("Leverage", 0) or 0) for x in lineup)
+
+    bt = str(build_type).lower()
+
+    if bt == "cash":
+        score = proj * 10000 + floor * 250
+    elif bt == "gpp":
+        score = proj * 7000 + ceil * 3500 + lev * 100
+    else:
+        score = proj * 6500 + ceil * 2500 + lev * 700
+
+    # Spend target is a preference, not a hard rejection.
+    if salary_used < int(min_spend):
+        score -= (int(min_spend) - salary_used) * 8
+    else:
+        score += salary_used * 3
+
+    return score
+
+
+def optimize_best_lineups_v103(
+    pool,
+    platform,
+    sport,
+    style,
+    salary_cap,
+    build_type="Cash",
+    max_lineups=5,
+    min_salary_pct=0.95,
+):
+    rules = dfs_get_rules(platform, sport, style)
+    slots = list(rules.get("slots", []))
+
+    if pool is None or pool.empty or not slots:
+        return []
+
+    p = pool.copy()
+    p["Salary"] = pd.to_numeric(p.get("Salary", 0), errors="coerce").fillna(0).astype(int)
+    p = p[p["Salary"] > 0].copy()
+
+    if p.empty:
+        return []
+
+    for col in ["DFS Projection", "Ceiling", "Floor", "DFS Confidence", "Leverage"]:
+        if col not in p.columns:
+            p[col] = 0
+        p[col] = pd.to_numeric(p[col], errors="coerce").fillna(0)
+
+    p["Value"] = p["DFS Projection"] / (p["Salary"].replace(0, 9999) / 1000)
+
+    bt = str(build_type).lower()
+    if bt == "cash":
+        p["Rank"] = p["DFS Projection"] * 1000 + p["Floor"] * 100 + p["DFS Confidence"] * 2 + p["Salary"] * 0.01
+    elif bt == "gpp":
+        p["Rank"] = p["DFS Projection"] * 800 + p["Ceiling"] * 500 + p["Leverage"] * 20 + p["Salary"] * 0.01
+    else:
+        p["Rank"] = p["DFS Projection"] * 700 + p["Ceiling"] * 300 + p["Leverage"] * 120 + p["Salary"] * 0.01
+
+    # Build candidate pool per slot. Keep enough players so we can spend up.
+    keep = []
+    for slot in set(slots + ["UTIL"]):
+        elig = p[p.apply(lambda r: eligible_for_slot_v98(r.get("Position", "UTIL"), slot), axis=1)].copy()
+        if not elig.empty:
+            keep.append(elig.sort_values(["Rank", "Salary"], ascending=False).head(160))
+
+    if keep:
+        p = pd.concat(keep, ignore_index=True).drop_duplicates(subset=["Player", "Salary", "Position"])
+
+    base_rows = p.sort_values(["Rank", "DFS Projection", "Salary"], ascending=False).to_dict("records")
+    salary_cap = int(salary_cap)
+    min_spend = int(float(salary_cap) * float(min_salary_pct))
+
+    lineups = []
+    seen = set()
+
+    def add_lineup(selected):
+        if not selected or len(selected) != len(slots):
+            return
+
+        salary_used = sum(int(x.get("Salary", 0) or 0) for x in selected)
+        if salary_used > salary_cap:
+            return
+
+        key = tuple(sorted([player_key_v103(x) for x in selected]))
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        projected = sum(float(x.get("DFS Projection", 0) or 0) for x in selected)
+        ceiling = sum(float(x.get("Ceiling", 0) or 0) for x in selected)
+        floor = sum(float(x.get("Floor", 0) or 0) for x in selected)
+        avg_conf = sum(float(x.get("DFS Confidence", 50) or 50) for x in selected) / len(selected)
+        score = lineup_score_v103(selected, salary_cap, min_spend, build_type)
+
+        lineups.append({
+            "Key": key,
+            "Build Type": build_type,
+            "Platform": platform,
+            "Sport": sport,
+            "Style": style,
+            "Salary Cap": salary_cap,
+            "Salary Used": int(salary_used),
+            "Salary Left": salary_cap - int(salary_used),
+            "Players": selected,
+            "Projected": round(projected, 2),
+            "Ceiling": round(ceiling, 2),
+            "Floor": round(floor, 2),
+            "Avg Confidence": round(avg_conf, 1),
+            "_Rank": score,
+        })
+
+    # 1) deterministic rotations of projection-ranked pool
+    for offset in range(min(len(base_rows), 300)):
+        rows = base_rows[offset:] + base_rows[:offset]
+        add_lineup(build_lineup_from_order_v103(rows, slots, salary_cap))
+
+    # 2) salary-heavy order to use cap
+    salary_rows = sorted(base_rows, key=lambda r: (float(r.get("DFS Projection", 0)), int(r.get("Salary", 0))), reverse=True)
+    for offset in range(min(len(salary_rows), 200)):
+        rows = salary_rows[offset:] + salary_rows[:offset]
+        add_lineup(build_lineup_from_order_v103(rows, slots, salary_cap))
+
+    # 3) randomized weighted search
+    rng = random.Random(103)
+    weighted_rows = sorted(base_rows, key=lambda r: float(r.get("Rank", 0)), reverse=True)
+
+    for _ in range(2500):
+        rows = weighted_rows.copy()
+
+        # Shuffle but preserve some bias toward top players by shuffling chunks.
+        top = rows[:80]
+        mid = rows[80:220]
+        rest = rows[220:]
+
+        rng.shuffle(top)
+        rng.shuffle(mid)
+        rng.shuffle(rest)
+
+        # Different builds bias differently.
+        if bt == "cash":
+            order = sorted(top[:35] + mid[:80] + rest[:60], key=lambda r: (float(r.get("DFS Projection", 0)), int(r.get("Salary", 0))), reverse=True)
+        elif bt == "gpp":
+            order = sorted(top[:45] + mid[:100] + rest[:80], key=lambda r: (float(r.get("Ceiling", 0)), float(r.get("DFS Projection", 0))), reverse=True)
+        else:
+            order = sorted(top[:45] + mid[:120] + rest[:100], key=lambda r: (float(r.get("Leverage", 0)), float(r.get("Ceiling", 0))), reverse=True)
+
+        # Randomly rotate the order so different slot fits happen.
+        if order:
+            cut = rng.randrange(0, len(order))
+            order = order[cut:] + order[:cut]
+
+        add_lineup(build_lineup_from_order_v103(order, slots, salary_cap))
+
+        if len(lineups) >= max(60, int(max_lineups) * 12):
+            break
+
+    if not lineups:
+        return []
+
+    good_spend = [x for x in lineups if int(x["Salary Used"]) >= min_spend]
+    rank_pool = good_spend if good_spend else lineups
+
+    return sorted(
+        rank_pool,
+        key=lambda x: (float(x.get("_Rank", 0)), float(x.get("Projected", 0)), int(x.get("Salary Used", 0))),
+        reverse=True
+    )[:int(max_lineups)]
+
+
 # =========================================================
 # APP
 # =========================================================
 
 auto_load_once()
+load_default_dashboard_sport()
 header()
 
 # Global search bar between Dashboard and Sportsbook nav/content
@@ -3199,7 +8552,6 @@ tabs = st.tabs([
     "🧾 Parlays",
     "🏗️ DFS Builder",
     "📍 Minnesota Apps",
-    "🔍 Search",
     "⚙️ Settings",
 ])
 
@@ -3212,13 +8564,20 @@ with tabs[0]:
     df = apply_global_search(ensure_schema(st.session_state["all_df"]))
 
     if df.empty:
-        st.info("Loading today's betting board...")
+        if not st.session_state.get("dashboard_retry_loaded", False):
+            st.session_state["dashboard_retry_loaded"] = True
+            with st.spinner("Loading main board..."):
+                load_one_sport_to_state("MLB")
+            st.rerun()
+
+        st.warning("Main board did not load yet.")
         reports_df = st.session_state.get("reports", pd.DataFrame())
         if isinstance(reports_df, pd.DataFrame) and not reports_df.empty:
             with st.expander("Load report"):
                 safe_dataframe(reports_df, use_container_width=True, hide_index=True)
+        st.caption("Go to Settings → Force Scan All Sports if MLB returned no rows.")
     else:
-        board = clean_user_facing_board(df, hide_low_interest=True)
+        board = cached_clean_board_for_ui(df).head(MAX_DASHBOARD_ROWS)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Games", board["Matchup"].nunique())
@@ -3242,7 +8601,7 @@ with tabs[0]:
         safe_dataframe(top, cols=dashboard_cols, use_container_width=True, hide_index=True)
 
         st.subheader("Top 5 AI Picks of the Day")
-        ai = add_ai_columns(board)
+        ai = cached_ai_board(df)
         ai = (
             ai
             .drop_duplicates(subset=["Matchup", "Pick Key", "Market", "Line"], keep="first")
@@ -3250,6 +8609,7 @@ with tabs[0]:
             .head(5)
         )
         render_top_ai_cards(ai, count=5)
+        save_today_top5_ai_picks_v2(ai)
 
 
 with tabs[1]:
@@ -3258,7 +8618,7 @@ with tabs[1]:
     if st.session_state["all_df"].empty:
         st.info("Dashboard is loading all sports. If nothing appears, use Refresh All Sports.")
     else:
-        df = apply_global_search(st.session_state["all_df"])
+        df = apply_global_search(ensure_schema(st.session_state["all_df"]))
         left, main = st.columns([1.05, 4.9])
 
         with left:
@@ -3272,6 +8632,11 @@ with tabs[1]:
 
         with main:
             sport_df = df[df["League"] == selected_sport].copy()
+            if sport_df.empty:
+                load_one_sport_to_state(selected_sport)
+                df = apply_global_search(ensure_schema(st.session_state["all_df"]))
+                sport_df = df[df["League"] == selected_sport].copy()
+            sport_df = trim_for_speed_safe(sport_df, MAX_SPORTBOOK_ROWS)
             st.subheader(f"{SPORT_EMOJI.get(selected_sport, '')} {selected_sport} Matchups")
 
             if sport_df.empty:
@@ -3281,18 +8646,7 @@ with tabs[1]:
                         load_one_sport_to_state(selected_sport)
                     st.rerun()
             else:
-                matchup_scores = (
-                    sport_df.groupby("Matchup")
-                    .agg(
-                        BestEdge=("Edge %", "max"),
-                        BestScore=("High Rate Score", "max"),
-                        Markets=("Pick", "count"),
-                        Props=("Is Prop", "sum"),
-                        GameScore=("Game Score", "first"),
-                    )
-                    .reset_index()
-                    .sort_values(["BestScore", "BestEdge"], ascending=False)
-                )
+                matchup_scores = cached_matchup_scores(sport_df)
 
                 matchup_list = matchup_scores["Matchup"].tolist()
 
@@ -3323,16 +8677,16 @@ with tabs[1]:
 
 with tabs[2]:
     st.header("AI Predictions")
-    st.caption("Top 5 AI pick tracking is available after picks load.")
+    st.caption("Top 5 AI picks are tracked automatically once per day.")
 
-    df = apply_global_search(st.session_state["all_df"])
+    df = apply_global_search(ensure_schema(st.session_state["all_df"]))
 
     if df.empty:
         st.info("Load all sports from the Dashboard first.")
     else:
         props_only = st.checkbox("Only player props", value=False, key="ai_props_only")
 
-        ai = add_ai_columns(clean_user_facing_board(df, hide_low_interest=True))
+        ai = cached_ai_board(df)
 
         if props_only:
             ai = ai[ai["Is Prop"] == True]
@@ -3347,16 +8701,8 @@ with tabs[2]:
         render_top_ai_cards(ai.head(20), count=20)
 
         st.divider()
-
-        c_save_ai, c_info_ai = st.columns([1, 3])
-        with c_save_ai:
-            if st.button("Save Today's Top 5", use_container_width=True):
-                save_today_top5_ai_picks(ai)
-                st.success("Saved today's Top 5 AI picks.")
-        with c_info_ai:
-            st.caption("Grade results later to track win/loss rate, units, and ROI.")
-
-        render_ai_tracker()
+        save_today_top5_ai_picks_v2(ai)
+        render_ai_tracker_v2()
 
         with st.expander("AI Picks Table"):
             safe_dataframe(
@@ -3375,7 +8721,7 @@ with tabs[2]:
 with tabs[3]:
     st.header("Arbitrage")
 
-    df = apply_global_search(st.session_state["all_df"])
+    df = apply_global_search(ensure_schema(st.session_state["all_df"]))
     if df.empty:
         st.info("Load all sports from the Dashboard first.")
     else:
@@ -3395,7 +8741,7 @@ with tabs[3]:
 with tabs[4]:
     st.header("Parlays")
 
-    df = apply_global_search(st.session_state["all_df"])
+    df = apply_global_search(ensure_schema(st.session_state["all_df"]))
     if df.empty:
         st.info("Load all sports from the Dashboard first.")
     else:
@@ -3417,72 +8763,8 @@ with tabs[4]:
 
 
 with tabs[5]:
-    st.header("DFS Builder")
-
-    df = apply_global_search(ensure_schema(st.session_state["all_df"]))
-    if df.empty:
-        st.info("Loading today's DFS player pool...")
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            platform = st.selectbox("Platform", ["DraftKings", "FanDuel"], index=0, key="dfs_platform")
-        with c2:
-            league_choice = st.selectbox("Sport", ["All"] + list(LEAGUES.keys()), index=0, key="dfs_league")
-        with c3:
-            lineup_size = st.selectbox("Lineup size", [4, 5, 6, 7, 8, 9], index=2, key="dfs_size")
-        with c4:
-            default_budget = dfs_default_budget(platform)
-            budget = st.number_input(
-                "Budget / Salary Cap",
-                min_value=10000,
-                max_value=100000,
-                value=default_budget,
-                step=500,
-                key=f"dfs_budget_{platform}",
-            )
-
-        max_lineups = st.selectbox("Lineups to build", [3, 5, 8, 10, 15], index=2, key="dfs_count")
-
-        pool = build_dfs_pool(df, league_choice)
-        pool = ensure_schema(pool)
-
-        if not pool.empty:
-            pool["Platform"] = platform
-            pool["Salary"] = pool.apply(lambda r: dfs_platform_salary(r, platform), axis=1)
-            pool["Position"] = pool.apply(lambda r: dfs_platform_positions(r, platform), axis=1)
-            pool["Value Per $1K"] = (
-                pd.to_numeric(pool["DFS Value"], errors="coerce").fillna(0)
-                / (pd.to_numeric(pool["Salary"], errors="coerce").fillna(9999) / 1000)
-            ).round(3)
-
-        st.metric("Player Pool", 0 if pool.empty else len(pool))
-
-        st.subheader("Best AI Lineups")
-        lineups = optimize_dfs_lineups(
-            df,
-            platform=platform,
-            budget=budget,
-            league_filter=league_choice,
-            lineup_size=lineup_size,
-            max_lineups=max_lineups,
-        )
-        render_budget_dfs_lineups(lineups)
-
-        with st.expander("View player pool"):
-            if pool.empty:
-                st.warning("No DFS players available from current board.")
-            else:
-                safe_dataframe(
-                    pool,
-                    cols=[
-                        "Position", "Player", "League", "Matchup", "Market", "Line", "Pick",
-                        "Salary", "DFS Projection", "DFS Value", "Value Per $1K",
-                        "Ceiling", "Floor", "Leverage", "DFS Confidence",
-                        "Edge %", "Model Probability %", "Best MN App", "Best Book"
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+    df = ensure_schema(st.session_state["all_df"])
+    render_dfs_simple_csv_v97(df)
 
 
 with tabs[6]:
@@ -3508,32 +8790,59 @@ with tabs[6]:
         st.link_button(app, url, use_container_width=True)
 
 
+
 with tabs[7]:
-    st.header("Search")
-
-    df = apply_global_search(st.session_state["all_df"])
-    if df.empty:
-        st.info("Load all sports from the Dashboard first.")
-    else:
-        query = st.text_input("Search player, team, matchup, market...", placeholder="Buxton, Twins, Total Bases...")
-        if query:
-            q = query.lower()
-            mask = (
-                df["Matchup"].astype(str).str.lower().str.contains(q, na=False)
-                | df["Player"].astype(str).str.lower().str.contains(q, na=False)
-                | df["Pick"].astype(str).str.lower().str.contains(q, na=False)
-                | df["Market"].astype(str).str.lower().str.contains(q, na=False)
-                | df["League"].astype(str).str.lower().str.contains(q, na=False)
-            )
-            results = df[mask].sort_values(["High Rate Score", "Edge %"], ascending=False)
-            st.metric("Results", len(results))
-            st.dataframe(view_cols(results.head(200)), use_container_width=True, hide_index=True)
-        else:
-            st.info("Type a search term.")
-
-
-with tabs[8]:
     st.header("Settings")
+
+    st.subheader("V86 DK Slate Discovery")
+    st.write("DFS Builder now attempts to list DraftKings draft groups/slates and load the selected slate salary CSV instead of grabbing the first available feed.")
+
+
+    st.subheader("DFS Auto Salary Loader")
+    st.write("V85 attempts to auto-load DraftKings salary CSVs when public slate endpoints are available. If the site blocks the feed, upload the salary CSV as backup.")
+
+
+    st.subheader("AI Tracker")
+    if st.button("Clean AI Tracker Duplicates", use_container_width=True, key="settings_clean_ai_tracker_duplicates_1"):
+        tracker = dedupe_ai_tracker(load_ai_tracker())
+        save_ai_tracker(tracker)
+        st.success("AI tracker duplicates cleaned.")
+
+    if st.button("Clear AI Tracker History", use_container_width=True, key="settings_clear_ai_tracker_history_main"):
+        empty_tracker = load_ai_tracker().head(0)
+        save_ai_tracker(empty_tracker)
+        st.success("AI tracker history cleared.")
+
+
+    st.subheader("AI Tracker Maintenance")
+    if st.button("Clean AI Tracker Duplicates", use_container_width=True, key="settings_clean_ai_tracker_duplicates_2"):
+        tracker = load_ai_tracker()
+        if not tracker.empty and "Pick ID" in tracker.columns:
+            tracker = tracker.drop_duplicates(subset=["Pick ID"], keep="last")
+            save_ai_tracker(tracker)
+            st.success("AI tracker duplicates cleaned.")
+        else:
+            st.info("No tracker rows to clean.")
+
+
+    if st.button("Reset Loaded Data", use_container_width=True, key="settings_reset_loaded_data_main"):
+        st.session_state["all_df"] = pd.DataFrame()
+        st.session_state["reports"] = pd.DataFrame()
+        st.session_state["loaded_default_sport"] = False
+        st.session_state["dashboard_retry_loaded"] = False
+        st.success("Reset loaded data. Refresh the app.")
+
+
+    st.subheader("Performance")
+    st.write("The app now opens with a lightweight main board and loads heavy sports/pages only when needed.")
+
+    if st.button("Force Scan All Sports", use_container_width=True, key="settings_force_scan_all_sports_main"):
+        with st.spinner("Scanning all sports..."):
+            df_all, reports = fetch_all_sports()
+            st.session_state["all_df"] = ensure_schema(df_all)
+            st.session_state["reports"] = reports
+            st.success("All sports scanned.")
+
     st.write("Structure: Sport → Matchup → Betting Lines → AI Evidence / Arbitrage / Player History.")
     st.write("Parlays now show matchup context, book, MN app routing, and alternate lines with edge.")
     st.write("Sport-specific prop filters remove bad props like MLB player Points.")
