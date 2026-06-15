@@ -1549,74 +1549,38 @@ def clean_board(df):
 
 
 def score_board(rows):
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df["Group"] = (
-        df["Matchup"].astype(str)
-        + "|" + df["Market"].astype(str)
-        + "|" + df["Pick Key"].astype(str)
-        + "|" + df["Side"].astype(str)
-        + "|" + df["Line"].astype(str)
-    )
-
-    scored = []
-
-    for _, group in df.groupby("Group"):
-        best = group.sort_values("Book Implied %", ascending=True).iloc[0]
-        avg = group["Book Implied %"].mean()
-
-        edge = max(0, round(avg - float(best["Book Implied %"]), 2))
-        model = round(avg, 2)
-        high_rate_score = round((model * 0.55) + (edge * 3.2), 2)
-
-        row = best.to_dict()
-        row["Market Avg %"] = round(avg, 2)
-        row["Edge %"] = edge
-        row["Model Probability %"] = model
-        row["High Rate Score"] = high_rate_score
-        row["Rating"] = rating(edge)
-        row["Units"] = units(edge)
-        row["Books Compared"] = len(group)
-        row["Bucket"] = market_bucket(row)
-        mn_best, mn_apps = recommend_mn_apps(row["Bucket"], row.get("Pick", ""), row.get("Market", ""), row.get("Is Prop", False))
-        row["Best MN App"] = mn_best
-        row["Available MN Apps"] = mn_apps
-        row["MN App Badges"] = mn_app_badges(mn_best, mn_apps)
-        scored.append(row)
-
-    board = pd.DataFrame(scored).sort_values(["High Rate Score", "Edge %"], ascending=False)
-    cleaned = clean_board(board)
-
-    # If a league would go completely blank, keep only sane non-NFL-future game lines as fallback.
-    # This prevents the entire app from showing nothing due to naming differences in the API.
-    if cleaned.empty and not board.empty:
-        fallback = board[board["Bucket"].isin(["Moneyline", "Spread", "Totals", "Event"])].copy()
-        fallback = fallback[~fallback.apply(is_far_future_nfl, axis=1)].copy()
-        cleaned = fallback.head(200)
-
-    return ensure_schema(cleaned)
-
+    """
+    V105 DraftKings-first scorer.
+    If DraftKings has the market, DK is the selected row.
+    If DK does not have the market, the row is removed from DraftKings mode.
+    """
+    return score_board_draftkings_first_v105(rows)
 
 def choose_display_rows(df):
-    if df.empty:
+    if df is None or df.empty:
         return df
+
+    work = clean_draftkings_board_v105(df)
+    if work is None or work.empty:
+        return ensure_schema(pd.DataFrame())
 
     group_cols = ["Matchup", "Pick Key", "Market", "Line"]
     out = []
 
-    for _, group in df.groupby(group_cols, dropna=False):
-        preferred = group[group["Best Book"].apply(is_preferred_user_app)]
-        if not preferred.empty:
-            row = preferred.sort_values(["Edge %", "High Rate Score"], ascending=False).iloc[0].copy()
-            row["Display Source"] = "Preferred MN/Pick'em App"
+    for _, group in work.groupby(group_cols, dropna=False):
+        dk = get_draftkings_rows_v105(group)
+        if not dk.empty:
+            row = dk.sort_values(["High Rate Score", "Edge %"], ascending=False).iloc[0].copy()
+            row["Display Source"] = "DraftKings"
         else:
-            row = group.sort_values(["High Rate Score", "Edge %"], ascending=False).iloc[0].copy()
-            row["Display Source"] = "Best Available Sportsbook"
+            continue
         out.append(row)
 
+    if not out:
+        return ensure_schema(pd.DataFrame())
+
     return pd.DataFrame(out).sort_values(["High Rate Score", "Edge %"], ascending=False)
+
 
 
 # =========================================================
@@ -1952,15 +1916,15 @@ def render_top_ai_cards(ai_df, count=5):
             c1.metric("AI Grade", row.get("AI Grade", ""))
             c2.metric("Confidence", row.get("AI Confidence", ""))
             c3.metric("Edge", f"{row['Edge %']}%")
-            c4.metric("Best MN App", row.get("Best MN App", ""))
+            c4.metric("Book", "DraftKings")
             st.write(f"**Evidence:** {ai_reason_text(row)}")
             st.write(
-                f"**Best Book:** {format_book_name(row['Best Book'])} • "
+                f"**DraftKings Odds:** {format_odds(row.get('Best Odds', 0)) if 'format_odds' in globals() else row.get('Best Odds', 0)} • "
                 f"**Model:** {row['Model Probability %']}% • "
                 f"**Suggested:** {row['Units']}u • "
                 f"**Books Compared:** {row['Books Compared']}"
             )
-            st.caption(f"Available MN Apps: {row.get('Available MN Apps', '')}")
+            st.caption("Available at DraftKings")
 
 
 def safe_key(text):
@@ -2073,7 +2037,7 @@ def render_player_history_panel(md):
 
 
 def render_matchup_detail(df, matchup):
-    md = df[df["Matchup"] == matchup].copy()
+    md = clean_draftkings_board_v105(df[df["Matchup"] == matchup].copy())
     if md.empty:
         st.warning("No markets found for this matchup.")
         return
@@ -2145,7 +2109,7 @@ def header():
         """
         <div class="hero">
             <div class="hero-title">CD BETTING</div>
-            <div class="hero-sub">Sportsbook edge scanner • AI tracker • robust DFS builder</div>
+            <div class="hero-sub">DraftKings sportsbook edge scanner • DK parlays • DK DFS</div>
             <span class="pill">Common markets only</span>
             <span class="pill">No fake odds</span>
             <span class="pill">AI confidence 0-100</span>
@@ -2260,7 +2224,7 @@ def view_cols(df):
     cols = [
         "League", "Game Time", "Matchup", "Live Score", "Game Score",
         "Bucket", "Market", "Player", "Bet Side", "Prop Line", "Pick",
-        "Best Odds", "Best Book", "Best MN App", "Available MN Apps",
+        "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App", "Available MN Apps",
         "Book Implied %", "Market Avg %", "Edge %",
         "Model Probability %", "High Rate Score", "Priority Score",
         "MLB Prop Tier", "Rating", "Units", "Books Compared",
@@ -2706,7 +2670,7 @@ def render_parlay_cards(parlays, legs):
 
     for _, row in parlays.head(10).iterrows():
         with st.container(border=True):
-            st.markdown(f"### {int(legs)}-Leg Suggested Parlay")
+            st.markdown(f"### DraftKings {int(legs)}-Leg Suggested Parlay")
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Combined Odds", format_odds(row.get("Combined Odds", 0)) if "format_odds" in globals() else row.get("Combined Odds", 0))
@@ -2720,7 +2684,7 @@ def render_parlay_cards(parlays, legs):
                 st.write(f"**Market:** {row.get(f'Leg {i} Market', '')}")
                 st.write(f"**Line:** {row.get(f'Leg {i} Line', '')}")
                 st.write(f"**Book:** {format_book_name(row.get(f'Leg {i} Book', '')) if 'format_book_name' in globals() else row.get(f'Leg {i} Book', '')}")
-                st.write(f"**Best MN App:** {row.get(f'Leg {i} MN App', '')}")
+                st.write("**Book:** DraftKings")
                 st.write(f"**Edge:** {row.get(f'Leg {i} Edge', '')}%")
 
             st.divider()
@@ -2954,7 +2918,7 @@ def load_ai_tracker():
     if not AI_TRACKER_PATH.exists():
         return pd.DataFrame(columns=[
             "Pick ID", "Date", "League", "Game Time", "Matchup", "Market", "Player",
-            "Line", "Pick", "Best Odds", "Best Book", "Best MN App",
+            "Line", "Pick", "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App",
             "Edge %", "Model Probability %", "AI Confidence",
             "Result", "Units Risked", "Units Won", "Graded At"
         ])
@@ -2964,14 +2928,14 @@ def load_ai_tracker():
     except Exception:
         return pd.DataFrame(columns=[
             "Pick ID", "Date", "League", "Game Time", "Matchup", "Market", "Player",
-            "Line", "Pick", "Best Odds", "Best Book", "Best MN App",
+            "Line", "Pick", "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App",
             "Edge %", "Model Probability %", "AI Confidence",
             "Result", "Units Risked", "Units Won", "Graded At"
         ])
 
     for col in [
         "Pick ID", "Date", "League", "Game Time", "Matchup", "Market", "Player",
-        "Line", "Pick", "Best Odds", "Best Book", "Best MN App",
+        "Line", "Pick", "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App",
         "Edge %", "Model Probability %", "AI Confidence",
         "Result", "Units Risked", "Units Won", "Graded At"
     ]:
@@ -3096,7 +3060,7 @@ def render_ai_tracker_v2():
     tracker = tracker.copy()
     needed = [
         "Pick ID", "Date", "League", "Game Time", "Matchup", "Pick",
-        "Best Odds", "Best Book", "Best MN App", "AI Confidence",
+        "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App", "AI Confidence",
         "Edge %", "Units Risked", "Units Won", "Graded At", "Result"
     ]
     for col in needed:
@@ -3177,7 +3141,7 @@ def render_ai_tracker_v2():
         shown,
         cols=[
             "Date", "Result", "League", "Game Time", "Matchup", "Pick",
-            "Best Odds", "Best Book", "Best MN App", "AI Confidence",
+            "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App", "AI Confidence",
             "Edge %", "Units Risked", "Units Won", "Graded At"
         ],
         use_container_width=True,
@@ -3361,7 +3325,7 @@ def dedupe_ai_tracker(tracker):
 
     for col in [
         "Pick ID", "Date", "League", "Game Time", "Matchup", "Market", "Player",
-        "Line", "Pick", "Best Odds", "Best Book", "Best MN App",
+        "Line", "Pick", "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App",
         "Edge %", "Model Probability %", "AI Confidence",
         "Result", "Units Risked", "Units Won", "Graded At"
     ]:
@@ -3498,7 +3462,7 @@ def render_ai_tracker_v2():
             today_rows,
             cols=[
                 "Date", "Result", "League", "Game Time", "Matchup", "Pick",
-                "Best Odds", "Best Book", "Best MN App", "AI Confidence", "Edge %"
+                "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App", "AI Confidence", "Edge %"
             ],
             use_container_width=True,
             hide_index=True,
@@ -3556,7 +3520,7 @@ def render_ai_tracker_v2():
             shown,
             cols=[
                 "Date", "Result", "League", "Game Time", "Matchup", "Pick",
-                "Best Odds", "Best Book", "Best MN App", "AI Confidence",
+                "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App", "AI Confidence",
                 "Edge %", "Units Risked", "Units Won", "Graded At"
             ],
             use_container_width=True,
@@ -8501,6 +8465,591 @@ def optimize_best_lineups_v103(
     )[:int(max_lineups)]
 
 
+
+# =========================================================
+# V104 SPORTSBOOK AVAILABILITY / NO GHOST PLAYERS
+# =========================================================
+
+SPORTSBOOK_NAME_ALIASES_V104 = {
+    "underdog": "Underdog",
+    "underdog fantasy": "Underdog",
+    "prizepicks": "PrizePicks",
+    "prize picks": "PrizePicks",
+    "fliff": "Fliff",
+    "draftkings": "DraftKings",
+    "dk": "DraftKings",
+    "fanduel": "FanDuel",
+    "fan duel": "FanDuel",
+    "betmgm": "BetMGM",
+    "mgm": "BetMGM",
+    "caesars": "Caesars",
+    "espn bet": "ESPN BET",
+    "espnbet": "ESPN BET",
+    "betrivers": "BetRivers",
+    "bet rivers": "BetRivers",
+    "hard rock": "Hard Rock",
+    "hardrock": "Hard Rock",
+    "chalkboard": "Chalkboard",
+    "sleeper": "Sleeper",
+}
+
+MINNESOTA_BOOKS_V104 = {
+    "Underdog", "PrizePicks", "Fliff", "Chalkboard", "Sleeper",
+    "DraftKings", "FanDuel", "BetMGM", "Caesars", "ESPN BET",
+    "BetRivers", "Hard Rock",
+}
+
+
+def norm_book_v104(book):
+    txt = str(book or "").strip()
+    if not txt or txt.lower() in ["nan", "none", "null"]:
+        return ""
+    return SPORTSBOOK_NAME_ALIASES_V104.get(txt.lower().strip(), txt.title() if txt.islower() else txt)
+
+
+def norm_market_v104(market):
+    txt = str(market or "").lower().strip()
+    txt = re.sub(r"[^a-z0-9]+", " ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+
+    aliases = [
+        ("batting bases on balls", "batting walks"),
+        ("bases on balls", "walks"),
+        ("base on balls", "walks"),
+        ("walks", "walks"),
+        ("pitching bases on balls", "pitching walks"),
+        ("pitcher walks", "pitching walks"),
+        ("pitching walks", "pitching walks"),
+        ("batting hits", "batting hits"),
+        ("hits", "batting hits"),
+        ("batting strikeouts", "batting strikeouts"),
+        ("batter strikeouts", "batting strikeouts"),
+        ("pitching strikeouts", "pitching strikeouts"),
+        ("pitcher strikeouts", "pitching strikeouts"),
+        ("total bases", "batting total bases"),
+        ("batting rbi", "batting rbi"),
+        ("runs batted in", "batting rbi"),
+        ("stolen bases", "stolen bases"),
+        ("home runs", "batting home runs"),
+        ("pitching outs", "pitching outs"),
+        ("earned runs", "pitching earned runs"),
+    ]
+    for needle, canon in aliases:
+        if needle in txt:
+            return canon
+    return txt
+
+
+def norm_side_v104(side):
+    txt = str(side or "").lower().strip()
+    if "over" in txt:
+        return "over"
+    if "under" in txt:
+        return "under"
+    return txt
+
+
+def norm_line_v104(line):
+    try:
+        return round(float(line), 2)
+    except Exception:
+        m = re.search(r"[-+]?\d+(\.\d+)?", str(line or ""))
+        if m:
+            try:
+                return round(float(m.group(0)), 2)
+            except Exception:
+                return None
+    return None
+
+
+def row_book_v104(row):
+    for col in ["Book", "Sportsbook", "SportsBook", "Book Name", "Best Book", "Best Sportsbook"]:
+        if col in row and str(row.get(col, "")).strip():
+            return norm_book_v104(row.get(col))
+    return ""
+
+
+def prop_key_v104(row, include_side=True):
+    player = normalize_player_name_for_join(clean_prop_player_name(row.get("Player", row.get("DFS Name", ""))))
+    market = norm_market_v104(row.get("Market", row.get("Prop Market", "")))
+    line = norm_line_v104(row.get("Line", row.get("Prop Line", "")))
+    parts = [player, market, str(line)]
+    if include_side:
+        parts.append(norm_side_v104(row.get("Bet Side", row.get("Side", row.get("Pick", "")))))
+    return "|".join(parts)
+
+
+def add_sportsbook_availability_v104(df, source_df=None):
+    """
+    Adds exact sportsbook availability so ghost players do not show as playable
+    on sportsbooks where the prop does not exist.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    src = source_df.copy() if source_df is not None and not source_df.empty else out.copy()
+
+    exact = {}
+    loose = {}
+
+    for _, rr in src.iterrows():
+        row = rr.to_dict()
+        book = row_book_v104(row)
+        if not book:
+            continue
+        exact.setdefault(prop_key_v104(row, include_side=True), set()).add(book)
+        loose.setdefault(prop_key_v104(row, include_side=False), set()).add(book)
+
+    available_books = []
+    available_count = []
+    best_available = []
+    available_mn = []
+
+    for _, rr in out.iterrows():
+        row = rr.to_dict()
+        books = set()
+
+        k1 = prop_key_v104(row, include_side=True)
+        k2 = prop_key_v104(row, include_side=False)
+
+        if k1 in exact:
+            books |= exact[k1]
+        if not books and k2 in loose:
+            books |= loose[k2]
+
+        own = row_book_v104(row)
+        if own:
+            books.add(own)
+
+        books = sorted([b for b in books if b])
+        mn_books = [b for b in books if b in MINNESOTA_BOOKS_V104]
+
+        current_best = norm_book_v104(row.get("Best Book", ""))
+        current_mn = norm_book_v104(row.get("Best MN App", ""))
+
+        if current_mn in books:
+            best = current_mn
+        elif current_best in books:
+            best = current_best
+        elif mn_books:
+            best = mn_books[0]
+        elif books:
+            best = books[0]
+        else:
+            best = ""
+
+        available_books.append(", ".join(books))
+        available_count.append(len(books))
+        best_available.append(best)
+        available_mn.append(bool(mn_books))
+
+    out["Available Books"] = available_books
+    out["Available Book Count"] = available_count
+    out["Best Available Book"] = best_available
+    out["Available In Minnesota"] = available_mn
+    out["Is Available"] = out["Available Book Count"] > 0
+
+    if "Best Book" not in out.columns:
+        out["Best Book"] = ""
+    if "Best MN App" not in out.columns:
+        out["Best MN App"] = ""
+
+    # Correct old misleading columns.
+    out["Best Book"] = out.apply(
+        lambda r: r["Best Available Book"] if r.get("Best Available Book") else r.get("Best Book", ""),
+        axis=1,
+    )
+    out["Best MN App"] = out.apply(
+        lambda r: r["Best Available Book"] if bool(r.get("Available In Minnesota", False)) else "",
+        axis=1,
+    )
+
+    return out
+
+
+def hide_unavailable_props_v104(df, mn_only=False):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "Is Available" not in out.columns:
+        out = add_sportsbook_availability_v104(out)
+    out = out[out["Is Available"] == True].copy()
+    if mn_only:
+        out = out[out["Available In Minnesota"] == True].copy()
+    return out
+
+
+def render_availability_filter_v104(df, key_prefix="availability"):
+    if df is None or df.empty:
+        return df
+
+    df = add_sportsbook_availability_v104(df)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        book = st.selectbox(
+            "Only show available at",
+            ["All"] + sorted(MINNESOTA_BOOKS_V104),
+            index=0,
+            key=f"{key_prefix}_book_v104",
+        )
+    with c2:
+        mn_only = st.checkbox("Minnesota apps only", value=False, key=f"{key_prefix}_mn_only_v104")
+
+    filtered = hide_unavailable_props_v104(df, mn_only=mn_only)
+
+    if book != "All":
+        b = norm_book_v104(book)
+        filtered = filtered[
+            filtered["Available Books"].fillna("").apply(
+                lambda x: b in [norm_book_v104(y.strip()) for y in str(x).split(",") if y.strip()]
+            )
+        ].copy()
+
+    removed = len(df) - len(filtered)
+    if removed > 0:
+        st.caption(f"Removed {removed} picks that are not available at the selected sportsbook filter.")
+
+    return filtered
+
+
+
+# =========================================================
+# V105 DRAFTKINGS-FIRST MODE
+# =========================================================
+
+DRAFTKINGS_NAMES_V105 = {
+    "draftkings",
+    "draft kings",
+    "dk",
+    "dk sportsbook",
+    "draftkings sportsbook",
+    "draftkings-sportsbook",
+}
+
+DRAFTKINGS_MODE_DEFAULT_V105 = True
+
+
+def is_draftkings_book_v105(book):
+    txt = str(book or "").lower().strip()
+    txt = re.sub(r"[^a-z0-9]+", " ", txt).strip()
+    return txt in DRAFTKINGS_NAMES_V105 or txt.startswith("draftkings")
+
+
+def row_is_draftkings_v105(row):
+    for col in ["Book", "Sportsbook", "SportsBook", "Book Name", "Best Book", "Best Sportsbook"]:
+        if col in row and is_draftkings_book_v105(row.get(col, "")):
+            return True
+    if "Available Books" in row:
+        books = [x.strip() for x in str(row.get("Available Books", "")).split(",")]
+        return any(is_draftkings_book_v105(x) for x in books)
+    if "Best Available Book" in row and is_draftkings_book_v105(row.get("Best Available Book", "")):
+        return True
+    return False
+
+
+def get_draftkings_rows_v105(group):
+    if group is None or group.empty:
+        return group
+    return group[group.apply(lambda r: row_is_draftkings_v105(r.to_dict()), axis=1)].copy()
+
+
+def score_market_group_draftkings_first_v105(group):
+    """
+    Given raw odds rows for one betting idea, pick DraftKings row if available.
+    Edge is calculated against market average. If DK is not available, return None
+    so DK-only screens do not show ghost picks.
+    """
+    if group is None or group.empty:
+        return None
+
+    group = group.copy()
+    group["Book Implied %"] = pd.to_numeric(group.get("Book Implied %", 50), errors="coerce").fillna(50)
+    group["Best Odds"] = pd.to_numeric(group.get("Best Odds", 0), errors="coerce").fillna(0)
+
+    dk = get_draftkings_rows_v105(group)
+    if dk.empty:
+        return None
+
+    # For the same pick, the best DK price is the lowest implied probability.
+    selected = dk.sort_values("Book Implied %", ascending=True).iloc[0]
+    avg = group["Book Implied %"].mean()
+
+    edge = max(0, round(avg - float(selected["Book Implied %"]), 2))
+    model = round(avg, 2)
+    high_rate_score = round((model * 0.55) + (edge * 3.2), 2)
+
+    row = selected.to_dict()
+    row["Market Avg %"] = round(avg, 2)
+    row["DraftKings Implied %"] = round(float(selected["Book Implied %"]), 2)
+    row["DraftKings Edge %"] = edge
+    row["Edge %"] = edge
+    row["Model Probability %"] = model
+    row["High Rate Score"] = high_rate_score
+    row["Rating"] = rating(edge) if "rating" in globals() else ""
+    row["Units"] = units(edge) if "units" in globals() else 0
+    row["Books Compared"] = len(group)
+    row["Bucket"] = market_bucket(row) if "market_bucket" in globals() else row.get("Bucket", "")
+    row["DraftKings Available"] = True
+    row["DraftKings Odds"] = row.get("Best Odds", 0)
+    row["DraftKings Pick"] = row.get("Pick", "")
+    row["Best Book"] = "DraftKings"
+    row["Best Available Book"] = "DraftKings"
+    row["Available Books"] = "DraftKings"
+    row["Best MN App"] = "DraftKings"
+    row["Available MN Apps"] = "DraftKings"
+    row["MN App Badges"] = "DraftKings"
+    return row
+
+
+def score_board_draftkings_first_v105(rows):
+    """
+    Replacement board scorer for DraftKings mode.
+    It only returns markets actually available at DK.
+    """
+    if not rows:
+        return pd.DataFrame()
+
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw
+
+    raw = ensure_schema(raw)
+
+    raw["Group"] = (
+        raw["Matchup"].astype(str)
+        + "|" + raw["Market"].astype(str)
+        + "|" + raw["Pick Key"].astype(str)
+        + "|" + raw["Side"].astype(str)
+        + "|" + raw["Line"].astype(str)
+    )
+
+    scored = []
+    for _, group in raw.groupby("Group"):
+        row = score_market_group_draftkings_first_v105(group)
+        if row is not None:
+            scored.append(row)
+
+    if not scored:
+        return pd.DataFrame()
+
+    board = pd.DataFrame(scored).sort_values(["High Rate Score", "Edge %"], ascending=False)
+    cleaned = clean_board(board) if "clean_board" in globals() else board
+    cleaned = ensure_schema(cleaned)
+
+    if "DraftKings Available" not in cleaned.columns:
+        cleaned["DraftKings Available"] = True
+
+    return cleaned
+
+
+def draftkings_only_board_v105(df):
+    """
+    User-facing board that only shows DraftKings-available bets.
+    Works on already-scored board data.
+    """
+    if df is None or df.empty:
+        return df
+
+    work = ensure_schema(df)
+    if "DraftKings Available" not in work.columns:
+        work["DraftKings Available"] = work.apply(lambda r: row_is_draftkings_v105(r.to_dict()), axis=1)
+
+    # If V104 availability exists, use it too.
+    if "Available Books" in work.columns:
+        work["DraftKings Available"] = work["DraftKings Available"] | work["Available Books"].fillna("").apply(
+            lambda x: any(is_draftkings_book_v105(b.strip()) for b in str(x).split(","))
+        )
+
+    work = work[work["DraftKings Available"] == True].copy()
+
+    if work.empty:
+        return ensure_schema(work)
+
+    work["Best Book"] = "DraftKings"
+    work["Best Available Book"] = "DraftKings"
+    work["Best MN App"] = "DraftKings"
+    work["Available MN Apps"] = "DraftKings"
+    work["Available Books"] = "DraftKings"
+
+    if "DraftKings Odds" not in work.columns:
+        work["DraftKings Odds"] = work["Best Odds"]
+    if "DraftKings Edge %" not in work.columns:
+        work["DraftKings Edge %"] = work["Edge %"]
+
+    return ensure_schema(work)
+
+
+def is_dk_core_market_v105(row):
+    bucket = str(row.get("Bucket", "")).lower()
+    market = str(row.get("Market", "")).lower()
+    if bucket in ["moneyline", "spread", "totals", "run line", "puck line", "player props"]:
+        return True
+    if any(x in market for x in ["moneyline", "spread", "total", "run line", "puck line", "player prop"]):
+        return True
+    return False
+
+
+def clean_draftkings_board_v105(df):
+    """
+    Clean board for DK sportsbook:
+    - DK available only
+    - common DK markets only
+    - sorted by AI/edge priority
+    """
+    if df is None or df.empty:
+        return df
+
+    work = draftkings_only_board_v105(df)
+    if work.empty:
+        return work
+
+    try:
+        work = clean_user_facing_board(work, hide_low_interest=True)
+    except Exception:
+        work = ensure_schema(work)
+
+    if not work.empty:
+        work = work[work.apply(lambda r: is_dk_core_market_v105(r.to_dict()), axis=1)].copy()
+
+    if "Priority Score" not in work.columns:
+        work["Priority Score"] = work.get("High Rate Score", 0)
+
+    return ensure_schema(work.sort_values(["Priority Score", "High Rate Score", "Edge %"], ascending=False))
+
+
+def render_dk_mode_banner_v105():
+    st.info("DraftKings Mode: only markets available at DraftKings are shown. Moneyline, spread, totals, run line/puck line, player props, parlays, and DFS are prioritized.")
+
+
+def render_draftkings_quick_links_v105():
+    links = {
+        "DraftKings Sportsbook": "https://sportsbook.draftkings.com/",
+        "DraftKings Lobby": "https://www.draftkings.com/lobby",
+        "DraftKings Lineups": "https://www.draftkings.com/lineup",
+    }
+    cols = st.columns(len(links))
+    for c, (label, url) in zip(cols, links.items()):
+        c.link_button(label, url, use_container_width=True)
+
+
+def build_draftkings_parlays_v105(df, legs=3, style="Balanced"):
+    """
+    DK sportsbook parlay builder.
+    Uses DK-only available rows. Supports game lines and player props.
+    """
+    work = clean_draftkings_board_v105(df)
+    if work is None or work.empty:
+        return pd.DataFrame()
+
+    edge = pd.to_numeric(work["Edge %"], errors="coerce").fillna(0)
+    odds = pd.to_numeric(work["Best Odds"], errors="coerce").fillna(0)
+
+    # Avoid dead odds rows.
+    work = work[(odds != 0)].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    # Style filters.
+    if style == "Safer":
+        work = work[work["Bucket"].isin(["Moneyline", "Spread", "Totals", "Run Line", "Puck Line"]) | (edge >= 4)].copy()
+    elif style == "High Edge":
+        work = work[edge >= max(2, edge.quantile(0.55) if len(edge) else 2)].copy()
+    elif style == "Player Props":
+        work = work[work["Is Prop"] == True].copy()
+
+    if work.empty:
+        work = clean_draftkings_board_v105(df)
+
+    work = work.drop_duplicates(subset=["Matchup", "Pick Key", "Market", "Line"], keep="first")
+    work = work.sort_values(["Priority Score", "High Rate Score", "Edge %"], ascending=False).head(120)
+
+    rows = work.to_dict("records")
+    out = []
+
+    for combo in itertools.combinations(rows, int(legs)):
+        # Avoid same exact player multiple times.
+        players = [str(x.get("Player", "")).strip().lower() for x in combo if str(x.get("Player", "")).strip()]
+        if len(players) != len(set(players)):
+            continue
+
+        # Allow same-game parlays only if user chose SGP style; default avoid same matchup duplicates.
+        matchups = [str(x.get("Matchup", "")) for x in combo]
+        if style != "Same Game" and len(matchups) != len(set(matchups)):
+            continue
+
+        dec_total = 1.0
+        hit = 1.0
+        total_edge = 0.0
+        valid = True
+
+        for leg in combo:
+            try:
+                dec_total *= american_to_decimal(leg.get("Best Odds", 0))
+                hit *= max(0.04, min(0.88, float(leg.get("Model Probability %", 50)) / 100))
+                total_edge += float(leg.get("Edge %", 0))
+            except Exception:
+                valid = False
+                break
+
+        if not valid:
+            continue
+
+        row = {
+            "Legs": int(legs),
+            "Parlay Type": style,
+            "Book": "DraftKings",
+            "Combined Odds": decimal_to_american(dec_total) if "decimal_to_american" in globals() else round(dec_total, 2),
+            "Estimated Hit %": round(hit * 100, 2),
+            "Total Edge": round(total_edge, 2),
+        }
+
+        for i, leg in enumerate(combo, start=1):
+            row[f"Leg {i} Pick"] = leg.get("Pick", "")
+            row[f"Leg {i} Matchup"] = leg.get("Matchup", "")
+            row[f"Leg {i} Market"] = leg.get("Market", "")
+            row[f"Leg {i} Line"] = leg.get("Line", "")
+            row[f"Leg {i} Odds"] = leg.get("Best Odds", "")
+            row[f"Leg {i} Book"] = "DraftKings"
+            row[f"Leg {i} Edge"] = leg.get("Edge %", 0)
+            row[f"Leg {i} MN App"] = "DraftKings"
+
+        out.append(row)
+
+        if len(out) >= 30:
+            break
+
+    if not out:
+        return pd.DataFrame()
+
+    return pd.DataFrame(out).sort_values(["Total Edge", "Estimated Hit %"], ascending=False)
+
+
+def render_dk_bet_card_v105(row):
+    with st.container(border=True):
+        st.markdown(f"### {row.get('Pick', '')}")
+        st.caption(f"{row.get('League', '')} • {row.get('Matchup', '')} • {row.get('Game Time', '')}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("DraftKings Odds", format_odds(row.get("Best Odds", 0)) if "format_odds" in globals() else row.get("Best Odds", 0))
+        c2.metric("Edge", f"{row.get('Edge %', 0)}%")
+        c3.metric("Model", f"{row.get('Model Probability %', 0)}%")
+        c4.metric("Units", f"{row.get('Units', 0)}u")
+        st.write(f"**Market:** {row.get('Market', '')}")
+        st.write(f"**Book:** DraftKings")
+        if row.get("Player", ""):
+            st.caption(f"Player: {row.get('Player', '')}")
+
+
+def render_dk_cards_v105(df, count=20):
+    board = clean_draftkings_board_v105(df)
+    if board is None or board.empty:
+        st.warning("No DraftKings-available markets found in this scan.")
+        return
+    for _, row in board.head(count).iterrows():
+        render_dk_bet_card_v105(row)
+
+
 # =========================================================
 # APP
 # =========================================================
@@ -8559,7 +9108,9 @@ st.caption(f"Last updated: {datetime.now(ZoneInfo('America/Chicago')).strftime('
 
 
 with tabs[0]:
-    st.header("Dashboard")
+    st.header("DraftKings Dashboard")
+    render_dk_mode_banner_v105()
+    render_draftkings_quick_links_v105()
 
     df = apply_global_search(ensure_schema(st.session_state["all_df"]))
 
@@ -8577,7 +9128,7 @@ with tabs[0]:
                 safe_dataframe(reports_df, use_container_width=True, hide_index=True)
         st.caption("Go to Settings → Force Scan All Sports if MLB returned no rows.")
     else:
-        board = cached_clean_board_for_ui(df).head(MAX_DASHBOARD_ROWS)
+        board = clean_draftkings_board_v105(cached_clean_board_for_ui(df)).head(MAX_DASHBOARD_ROWS)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Games", board["Matchup"].nunique())
@@ -8595,13 +9146,13 @@ with tabs[0]:
 
         dashboard_cols = [
             "League", "Game Time", "Matchup", "Market", "Player", "Bet Side",
-            "Prop Line", "Pick", "Best Odds", "Best Book", "Best MN App",
+            "Prop Line", "Pick", "Best Odds", "Best Available Book", "Available Books", "Best Book", "Best MN App",
             "Edge %", "Model Probability %", "Rating", "Units", "Books Compared"
         ]
         safe_dataframe(top, cols=dashboard_cols, use_container_width=True, hide_index=True)
 
         st.subheader("Top 5 AI Picks of the Day")
-        ai = cached_ai_board(df)
+        ai = clean_draftkings_board_v105(cached_ai_board(df))
         ai = (
             ai
             .drop_duplicates(subset=["Matchup", "Pick Key", "Market", "Line"], keep="first")
@@ -8613,7 +9164,8 @@ with tabs[0]:
 
 
 with tabs[1]:
-    st.header("Sportsbook")
+    st.header("DraftKings Sportsbook")
+    render_dk_mode_banner_v105()
 
     if st.session_state["all_df"].empty:
         st.info("Dashboard is loading all sports. If nothing appears, use Refresh All Sports.")
@@ -8631,11 +9183,11 @@ with tabs[1]:
             render_sports_rail(df, selected_sport)
 
         with main:
-            sport_df = df[df["League"] == selected_sport].copy()
+            sport_df = clean_draftkings_board_v105(df[df["League"] == selected_sport].copy())
             if sport_df.empty:
                 load_one_sport_to_state(selected_sport)
                 df = apply_global_search(ensure_schema(st.session_state["all_df"]))
-                sport_df = df[df["League"] == selected_sport].copy()
+                sport_df = clean_draftkings_board_v105(df[df["League"] == selected_sport].copy())
             sport_df = trim_for_speed_safe(sport_df, MAX_SPORTBOOK_ROWS)
             st.subheader(f"{SPORT_EMOJI.get(selected_sport, '')} {selected_sport} Matchups")
 
@@ -8676,7 +9228,8 @@ with tabs[1]:
 
 
 with tabs[2]:
-    st.header("AI Predictions")
+    st.header("DraftKings AI Predictions")
+    render_dk_mode_banner_v105()
     st.caption("Top 5 AI picks are tracked automatically once per day.")
 
     df = apply_global_search(ensure_schema(st.session_state["all_df"]))
@@ -8686,7 +9239,7 @@ with tabs[2]:
     else:
         props_only = st.checkbox("Only player props", value=False, key="ai_props_only")
 
-        ai = cached_ai_board(df)
+        ai = clean_draftkings_board_v105(cached_ai_board(df))
 
         if props_only:
             ai = ai[ai["Is Prop"] == True]
@@ -8709,7 +9262,7 @@ with tabs[2]:
                 ai,
                 cols=[
                     "AI Grade", "AI Confidence", "League", "Game Time", "Matchup",
-                    "Bucket", "Market", "Player", "Pick", "Best Odds", "Best Book",
+                    "Bucket", "Market", "Player", "Pick", "Best Odds", "Best Available Book", "Available Books", "Best Book",
                     "Best MN App", "Edge %", "Model Probability %",
                     "Books Compared", "Rating"
                 ],
@@ -8739,7 +9292,8 @@ with tabs[3]:
 
 
 with tabs[4]:
-    st.header("Parlays")
+    st.header("DraftKings Parlays")
+    render_dk_mode_banner_v105()
 
     df = apply_global_search(ensure_schema(st.session_state["all_df"]))
     if df.empty:
@@ -8751,7 +9305,8 @@ with tabs[4]:
         )
 
         legs = st.selectbox("Legs", [2, 3, 4], index=1)
-        parlays = build_parlays(df, legs=legs)
+        parlay_style = st.selectbox("DraftKings parlay style", ["Balanced", "Safer", "High Edge", "Player Props", "Same Game"], index=0)
+        parlays = build_draftkings_parlays_v105(df, legs=legs, style=parlay_style)
 
         render_parlay_cards(parlays, legs)
 
@@ -8763,31 +9318,27 @@ with tabs[4]:
 
 
 with tabs[5]:
-    df = ensure_schema(st.session_state["all_df"])
+    df = add_sportsbook_availability_v104(ensure_schema(st.session_state["all_df"]))
     render_dfs_simple_csv_v97(df)
 
 
 with tabs[6]:
-    st.header("Minnesota Betting App Guide")
-    st.warning(
-        "Minnesota does not currently have normal statewide online sportsbook apps. "
-        "This app routes bets toward fantasy/pick'em/DFS-style apps to check first. "
-        "Always confirm eligibility inside the app before depositing."
-    )
+    st.header("DraftKings Guide")
+    st.success("DraftKings mode is active. The app now prioritizes DraftKings sportsbook lines, DraftKings parlays, and DraftKings DFS.")
 
     guide_rows = [
-        {"Bet Type": "Player Props", "Best First Check": "Underdog", "Also Check": "PrizePicks, Sleeper, Chalkboard, DraftKings Pick6 / DFS, Dabble", "Example": "Olivia Miles Over 2.5 3PT Made"},
-        {"Bet Type": "Pick'em / Multi-Leg Props", "Best First Check": "Underdog", "Also Check": "PrizePicks, Sleeper, Chalkboard, Dabble", "Example": "2-6 player prop entries"},
-        {"Bet Type": "Team Pick / Winner", "Best First Check": "Underdog", "Also Check": "Sleeper, PrizePicks, Chalkboard", "Example": "Fever Moneyline-style pick"},
-        {"Bet Type": "Spread / Total Style Picks", "Best First Check": "Underdog", "Also Check": "PrizePicks, Sleeper, Chalkboard", "Example": "Team +1.5 or Over 8.5"},
-        {"Bet Type": "DFS Lineups", "Best First Check": "DraftKings Pick6 / DFS", "Also Check": "FanDuel DFS, Sleeper", "Example": "Salary-cap contests / fantasy entries"},
+        {"Bet Type": "Moneyline", "DraftKings Use": "Game winner bets", "App Area": "Sportsbook"},
+        {"Bet Type": "Spread / Run Line / Puck Line", "DraftKings Use": "Team handicap markets", "App Area": "Sportsbook"},
+        {"Bet Type": "Totals", "DraftKings Use": "Game over/under markets", "App Area": "Sportsbook"},
+        {"Bet Type": "Player Props", "DraftKings Use": "Player stat overs/unders", "App Area": "Sportsbook"},
+        {"Bet Type": "Parlays", "DraftKings Use": "2-4 leg suggested parlays from DK-available markets", "App Area": "Parlays"},
+        {"Bet Type": "DFS", "DraftKings Use": "Upload DK salary CSV and build lineups", "App Area": "DFS Builder"},
     ]
+    safe_dataframe(pd.DataFrame(guide_rows), use_container_width=True, hide_index=True)
 
-    st.dataframe(pd.DataFrame(guide_rows), use_container_width=True, hide_index=True)
+    st.subheader("DraftKings Links")
+    render_draftkings_quick_links_v105()
 
-    st.subheader("Links")
-    for app, url in MN_APP_LINKS.items():
-        st.link_button(app, url, use_container_width=True)
 
 
 
